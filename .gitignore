@@ -16,3 +16,6 @@ dist/
 # Éditeurs
 .vscode/
 .idea/
+
+# Configuration locale de signature (jamais publiee)
+.env.local

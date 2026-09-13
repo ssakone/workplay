@@ -63,6 +63,17 @@ une fois, puis c'est vous qui décidez.
 
 ## Installation
 
+### Téléchargement
+
+Une version signée et **notarisée** par Apple est publiée dans les
+[releases](https://github.com/ssakone/workplay/releases) :
+
+- `WorkPlay-1.0.0.dmg` — à monter, puis glisser WorkPlay dans Applications
+- `WorkPlay-1.0.0.zip` — archive de l'application
+
+Le ticket de notarisation étant agrafé, l'application s'ouvre par un simple
+double-clic, sans avertissement de Gatekeeper.
+
 ### Depuis les sources (recommandé)
 
 Prérequis : **macOS**, **Python 3.10+**, et pour le téléchargement
@@ -100,6 +111,31 @@ barre de menus.
 > l'ouverture par double-clic d'un bundle signé adhoc. Contournement :
 > clic droit → **Ouvrir**, ou
 > `xattr -d com.apple.quarantine "dist/WorkPlay.app"`.
+
+### Signer pour la distribution et notariser
+
+Pour produire un bundle que n'importe qui peut ouvrir sans avertissement, il
+faut un certificat **Developer ID Application** et une clé API App Store
+Connect.
+
+```bash
+cp .env.local.example .env.local    # renseigne les chemins et identifiants
+./tools/sign-keychain.sh create     # trousseau temporaire avec le certificat
+./tools/release.sh 1.0.0            # signature, notarisation, DMG, ZIP
+./tools/sign-keychain.sh destroy    # nettoyage
+```
+
+`release.sh` enchaîne : signature Developer ID du bundle, soumission à Apple et
+attente du verdict, agrafage du ticket, fabrication du DMG, nouvelle
+notarisation du DMG, empreintes SHA-256, et enfin une évaluation Gatekeeper qui
+**échoue si l'application n'est pas acceptée**.
+
+Le certificat est importé dans un trousseau dédié (`workplay-signing.keychain-db`)
+plutôt que dans votre trousseau de session : l'opération est jetable et
+n'altère rien de votre configuration.
+
+Aucun identifiant Apple n'est stocké dans le dépôt : tout passe par
+`.env.local`, ignoré par git.
 
 ![Panneau de réglages](assets/settings.png)
 
@@ -156,7 +192,6 @@ WORKPLAY_DIR=~/Musique/MaCollection ./.venv/bin/python app.py
 Extensions reconnues : `mp3`, `m4a`, `aac`, `wav`, `flac`, `ogg`, `opus`, `webm`.
 
 ## Configuration
-
 | Variable d'environnement | Effet |
 |---|---|
 | `WORKPLAY_DIR` | Dossier musical (prioritaire sur le choix mémorisé) |
@@ -195,6 +230,8 @@ workplay/
 │   └── entitlements.plist  entitlements de signature macOS
 └── tools/
     ├── build.sh            build + signature du .app
+    ├── release.sh          signature Developer ID, notarisation, DMG
+    ├── sign-keychain.sh    trousseau temporaire pour la signature
     └── make_icns.py        génère le .icns depuis une image carrée
 ```
 
@@ -219,12 +256,13 @@ au-delà de PySide6.
 - **`yt-dlp` en sous-processus** plutôt qu'en bibliothèque : l'outil en ligne de
   commande est plus simple à mettre à jour (les sites changent souvent) et sa
   progression est directement lisible sur sa sortie standard.
+- **Notarisation avec agrafage du ticket.** La soumission seule ne suffit pas :
+  sans `stapler staple`, la vérification Gatekeeper exige une connexion réseau
+  au premier lancement. Le ticket agrafé rend l'application ouvrable hors ligne.
 
 ## Limitations connues
 
 - macOS uniquement (le tray, la translucidité et la signature sont spécifiques).
-- Aucune signature *Developer ID* : Gatekeeper demande une confirmation au
-  premier lancement sur une autre machine.
 - Si une application passe en plein écran, le widget peut se retrouver
 derrière : un clic sur **Ramener au premier plan** le replace. C'est
 volontaire — la correction automatique exigerait de reprendre le focus, ce
