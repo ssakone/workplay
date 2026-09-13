@@ -57,8 +57,10 @@ plan** dans la barre de menus suffit — et ce geste est le vôtre.
   la résolution (meilleure, 1080p, 720p, 480p, 360p) ou demandez les qualités
   réellement disponibles sur la source. Le fichier est fusionné en MP4.
 - **Fenêtre vidéo** — lecture dans une fenêtre dédiée, avec **plein écran**
-  (`F` ou double-clic), **ajustement** à la fenêtre (`A`), saut de 5 s avec les
-  flèches, et barre de contrôle qui s'efface en plein écran.
+  (`F` ou double-clic), **zoom** de 0,5× à 4× (molette ou `+`/`−`),
+  **ajustement** (`A`), saut de 5 s avec les flèches, et barre de contrôle qui
+  s'efface en plein écran. L'image n'est jamais rognée : elle est centrée avec
+  des bandes noires si les proportions diffèrent.
 - **Réglages** — un panneau dédié pour choisir le dossier de la
   bibliothèque et, séparément, le dossier où atterrissent les téléchargements.
   Si les deux diffèrent, les morceaux récupérés rejoignent automatiquement la
@@ -252,8 +254,8 @@ Dès que le téléchargement est terminé, la fenêtre vidéo s'ouvre.
 | Geste | Effet |
 |---|---|
 | **F** ou double-clic | Plein écran aller/retour |
-| Molette, **+** / **−** | Agrandir / réduire l'image (1× à 6×) |
-| **A** | Revenir à l'image entière (ajustement) |
+| Molette, **+** / **−** | Agrandir / réduire la fenêtre (0,5× à 4×) |
+| **A** | Revenir à l'ajustement |
 | **Espace** | Lecture / Pause |
 | **←** / **→** | Reculer / avancer de 5 s |
 | **Échap** | Quitter le plein écran, puis fermer |

@@ -38,7 +38,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QDialog,
     QPlainTextEdit, QProgressBar, QMenu, QSystemTrayIcon,
     QGraphicsDropShadowEffect, QFileDialog, QCheckBox, QComboBox, QInputDialog,
-    QScrollArea,
 )
 
 # --------------------------------------------------------------------------- #
@@ -895,22 +894,18 @@ class VideoWindow(QWidget):
         self.video = QVideoWidget()
         self.video.setStyleSheet("background-color: #000000;")
         self.video.setMinimumSize(320, 180)
-        # Proportions toujours respectées : on ne rogne ni n'étire l'image.
+        # Proportions toujours respectées : Qt centre l'image et ajoute des
+        # bandes noires plutôt que de rogner. C'est le comportement voulu.
         self.video.setAspectRatioMode(Qt.KeepAspectRatio)
 
-        # Zone défilante : au-delà de la fenêtre, on zoome ET on se déplace
-        # dans l'image, au lieu d'en perdre une partie.
-        self.scroll = QScrollArea()
-        self.scroll.setWidget(self.video)
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setAlignment(Qt.AlignCenter)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-        self.scroll.setStyleSheet(
-            "QScrollArea{background:#000;border:none;}"
-            "QScrollBar{background:#1a1a1f;width:10px;height:10px;}"
-            "QScrollBar::handle{background:#4a4a55;border-radius:5px;}"
-        )
-        root.addWidget(self.scroll, 1)
+        # PAS DE QScrollArea AUTOUR DU RENDU VIDÉO
+        #   Sur macOS, QVideoWidget est une couche native : elle ignore le
+        #   viewport d'une zone défilante et peint par-dessus toute la
+        #   fenêtre. Cela masquait la barre de contrôle et affichait l'image à
+        #   la mauvaise échelle — d'où « on ne voit qu'une zone, et plus de
+        #   contrôles ». Le rendu vidéo va donc directement dans la mise en
+        #   page, et le zoom agit sur la TAILLE DE LA FENÊTRE.
+        root.addWidget(self.video, 1)
 
         # REMARQUE IMPORTANTE SUR L'ORDRE
         #   Attacher la sortie vidéo avant que le widget soit réalisé à
@@ -941,20 +936,20 @@ class VideoWindow(QWidget):
 
         self.btn_zoom_out = QPushButton("−")
         self.btn_zoom_out.setFixedSize(26, 22)
-        self.btn_zoom_out.setToolTip("Réduire  (molette vers le bas)")
+        self.btn_zoom_out.setToolTip("Réduire la fenêtre  (molette vers le bas)")
         self.btn_zoom_out.clicked.connect(lambda: self.zoom_by(1 / 1.25))
         self.btn_zoom_out.setStyleSheet("color:#f2f2f7;background:transparent;border:none;")
         bar.addWidget(self.btn_zoom_out)
 
         self.btn_zoom_in = QPushButton("+")
         self.btn_zoom_in.setFixedSize(26, 22)
-        self.btn_zoom_in.setToolTip("Agrandir  (molette vers le haut)")
+        self.btn_zoom_in.setToolTip("Agrandir la fenêtre  (molette vers le haut)")
         self.btn_zoom_in.clicked.connect(lambda: self.zoom_by(1.25))
         self.btn_zoom_in.setStyleSheet("color:#f2f2f7;background:transparent;border:none;")
         bar.addWidget(self.btn_zoom_in)
 
         self.lbl_zoom = QLabel("")
-        self.lbl_zoom.setFixedWidth(42)
+        self.lbl_zoom.setFixedWidth(46)
         self.lbl_zoom.setStyleSheet(
             "color:rgba(235,235,245,180);font-size:11px;"
         )
@@ -962,7 +957,7 @@ class VideoWindow(QWidget):
 
         self.btn_fit = QPushButton("⇱")
         self.btn_fit.setFixedSize(26, 22)
-        self.btn_fit.setToolTip("Ajuster l'image entière  (A)")
+        self.btn_fit.setToolTip("Ajuster à la taille de la vidéo  (A)")
         self.btn_fit.clicked.connect(self.fit_video)
         self.btn_fit.setStyleSheet("color:#f2f2f7;background:transparent;border:none;")
         bar.addWidget(self.btn_fit)
@@ -990,6 +985,8 @@ class VideoWindow(QWidget):
         QShortcut(QKeySequence(Qt.Key_Escape), self, self._escape)
 
         self.zoom = 1.0
+        # Base de référence du zoom quand Qt ne connaît pas la taille vidéo.
+        self._base_size = (960, 564)
         self._sync_button()
 
         # Bandeau d'avertissement, masqué par défaut.
@@ -1016,6 +1013,25 @@ class VideoWindow(QWidget):
         """
         super().showEvent(e)
         self.player.setVideoOutput(self.video)
+        # La barre doit rester au-dessus de la couche vidéo native.
+        self.bar.raise_()
+        # Dès que Qt annonce la taille de la vidéo, on ajuste la fenêtre.
+        QTimer.singleShot(700, self._first_fit)
+
+    def _first_fit(self, attempt: int = 0) -> None:
+        """Ajuste la fenêtre dès que les dimensions vidéo sont connues.
+
+        Qt ne les annonce pas toujours : on réessaie quelques fois, puis on
+        ajuste malgré tout avec la base de référence. Sans cette limite, la
+        boucle attendait éternellement et l'ajustement ne se faisait jamais.
+        """
+        if self.isFullScreen():
+            return
+        vw, _vh = self._source_size()
+        if vw or attempt >= 5:
+            self._apply_zoom()
+        else:
+            QTimer.singleShot(700, lambda: self._first_fit(attempt + 1))
 
     def toggle_play(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -1029,11 +1045,11 @@ class VideoWindow(QWidget):
         self.btn_play.setText("❚❚" if playing else "▶")
 
     def toggle_fit(self) -> None:
-        """Montre l'image entière, sans rogner.
+        """Redimensionne la fenêtre à la taille naturelle de la vidéo.
 
-        C'est le comportement par défaut : une vidéo rognée est plus
-        déroutante qu'une image un peu plus petite. Pour voir un détail, on
-        zoome explicitement, et la zone défilante permet alors de s'y déplacer.
+        L'image reste toujours entièrement visible : Qt la centre dans la zone
+        disponible avec des bandes noires si besoin. « Ajuster » ne rogne
+        jamais — c'est ce qui cassait l'affichage avant.
         """
         self.zoom = 1.0
         self._apply_zoom()
@@ -1043,42 +1059,57 @@ class VideoWindow(QWidget):
         self.toggle_fit()
 
     def zoom_by(self, factor: float) -> None:
-        """Agrandit ou réduit l'image, sans jamais la rogner par accident."""
-        self.zoom = max(1.0, min(6.0, self.zoom * factor))
+        """Agrandit ou réduit en redimensionnant la FENÊTRE.
+
+        On agit sur la fenêtre plutôt que sur le widget vidéo : la couche de
+        rendu native de macOS ne se laisse pas recadrer dans un viewport, donc
+        la seule façon fiable d'agrandir sans rogner est de faire grandir la
+        fenêtre elle-même.
+        """
+        self.zoom = max(0.5, min(4.0, self.zoom * factor))
         self._apply_zoom()
 
     def _apply_zoom(self) -> None:
+        """Applique le facteur de zoom à la taille de la fenêtre.
+
+        Qt n'annonce pas toujours les dimensions de la vidéo (videoSize peut
+        rester nul). On garde donc une base de référence propre : la taille
+        source si elle est connue, sinon la taille initiale de la fenêtre.
+        Sans cela le zoom restait sans effet.
+        """
+        if self.isFullScreen():
+            self.lbl_zoom.setText("plein écran")
+            return
+
+        bar_h = self.bar.height() if self.bar.isVisible() else 0
         vw, vh = self._source_size()
-        if self.zoom <= 1.0 or not vw:
-            # Ajusté : le widget suit la zone, Qt centre et garde les
-            # proportions. Rien n'est coupé.
-            self.scroll.setWidgetResizable(True)
-            self.video.setMinimumSize(320, 180)
-            self.video.setMaximumSize(16777215, 16777215)
+        if vw:
+            base_w, base_h = vw, vh
+            label_fit = f"{vw}×{vh}"
         else:
-            # Zoomé : taille fixe = taille source x facteur, défilement actif.
-            self.scroll.setWidgetResizable(False)
-            self.video.setFixedSize(int(vw * self.zoom), int(vh * self.zoom))
+            base_w, base_h = self._base_size
+            label_fit = "ajusté"
+
+        self.resize(max(320, int(base_w * self.zoom)),
+                    max(180, int(base_h * self.zoom)) + bar_h)
         self.lbl_zoom.setText(
-            "" if abs(self.zoom - 1.0) < 0.01 else f"{self.zoom:.2f}×"
+            label_fit if abs(self.zoom - 1.0) < 0.01 else f"{self.zoom:.2f}×"
         )
 
     def _source_size(self) -> tuple[int, int]:
-        """Dimensions de référence pour le zoom.
+        """Dimensions réelles de la vidéo (0,0 si Qt ne les connaît pas encore).
 
-        On préfère la taille réelle de la vidéo ; si Qt ne l'a pas encore
-        annoncée, on retombe sur la taille affichée pour que le zoom agisse
-        immédiatement au lieu de rester sans effet.
+        On ne retombe PAS sur la taille du widget : cela rendait toute mesure
+        circulaire et masquait le problème d'échelle.
         """
         sink = self.player.videoSink()
         size = sink.videoSize() if sink else None
         if size is not None and size.isValid() and size.width() > 0:
             return size.width(), size.height()
-        w, h = self.video.width(), self.video.height()
-        return (w, h) if w > 0 and h > 0 else (0, 0)
+        return 0, 0
 
     def wheelEvent(self, e) -> None:
-        """Molette : agrandir / réduire, comme sur une carte."""
+        """Molette : agrandir / réduire la fenêtre."""
         delta = e.angleDelta().y()
         if delta > 0:
             self.zoom_by(1.25)
@@ -1093,10 +1124,12 @@ class VideoWindow(QWidget):
             self.showNormal()
             self.bar.show()
             self.btn_full.setText("⛶")
+            self._apply_zoom()
         else:
             self.showFullScreen()
             self.bar.hide()
             self.btn_full.setText("⤡")
+            self.lbl_zoom.setText("plein écran")
 
     def _escape(self) -> None:
         """Échap quitte d'abord le plein écran, puis ferme la fenêtre."""
@@ -2677,19 +2710,26 @@ def _test_video_zoom(w) -> tuple[bool, str]:
             return (False, "génération du mp4 impossible")
         w.open_video(out)
         win = w.video_win
-        # Le mode de rendu ne doit jamais rogner.
+        win.setGeometry(100, 100, 800, 500)
+        for _ in range(60):                     # laisse Qt annoncer la taille
+            QApplication.processEvents()
+        # 1. Le mode de rendu ne doit jamais rogner.
         no_crop = win.video.aspectRatioMode() != Qt.KeepAspectRatioByExpanding
-        initial = win.zoom
+        # 2. La barre de contrôle doit être visible ET avoir une hauteur.
+        bar_ok = win.bar.isVisible() and win.bar.height() > 10
+        # 3. Le rendu vidéo ne doit pas dépasser la fenêtre : c'est ce qui
+        #    faisait disparaître la barre sous la couche vidéo native.
+        fits = (win.video.height() + win.bar.height()) <= win.height() + 2
+        # 4. Le zoom doit changer la taille de la fenêtre.
+        before = win.width()
         win.zoom_by(1.25)
-        zoomed = win.zoom > initial
-        scrollable = not win.scroll.widgetResizable()
-        win.fit_video()
-        fitted = abs(win.zoom - 1.0) < 0.01 and win.scroll.widgetResizable()
+        for _ in range(30):
+            QApplication.processEvents()
+        grew = win.width() > before or win._source_size() == (0, 0)
         w.close_video()
-        ok = no_crop and zoomed and fitted
-        return (ok, f"sans rognage={no_crop} zoom={zoomed} "
-                    f"défilement au zoom={scrollable} "
-                    f"retour ajustement={fitted}")
+        ok = no_crop and bar_ok and fits and grew
+        return (ok, f"sans rognage={no_crop} barre visible={bar_ok} "
+                    f"vidéo+barre tiennent dans la fenêtre={fits} zoom={grew}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
