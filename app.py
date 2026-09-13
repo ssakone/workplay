@@ -482,8 +482,11 @@ class DownloadDialog(QDialog):
         # bibliothèque, le morceau est déplacé après coup (voir Player).
         self.download_dir = download_dir or music_dir
         self.queue: deque[str] = deque()
-        self.done = 0
-        self.failed = 0
+        # Noms volontairement préfixés : « done » et « failed » écraseraient
+        # des méthodes de QDialog (dont done(), que Qt appelle en interne),
+        # ce qui cassait la fermeture du dialogue.
+        self.n_done = 0
+        self.n_failed = 0
         self.total = 0
         self.current: str | None = None
 
@@ -549,12 +552,28 @@ class DownloadDialog(QDialog):
         self.proc = QProcess(self)
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
         self.proc.setProcessEnvironment(process_env())
+        self._prepare_dirs()
         self.proc.setWorkingDirectory(str(self.music_dir))
         self.proc.readyReadStandardOutput.connect(self._on_output)
+        # Un échec de lancement doit se voir, pas disparaître.
+        self.proc.errorOccurred.connect(self._on_error)
         self.proc.finished.connect(self._on_proc_finished)
 
         if find_ytdlp() is None:
             self._log("yt-dlp introuvable — installe-le : brew install yt-dlp ffmpeg")
+
+    def _prepare_dirs(self) -> None:
+        """Crée les dossiers de travail : un dossier absent fait échouer le
+        lancement de yt-dlp, ce qui était auparavant totalement silencieux."""
+        for d in {self.music_dir, self.download_dir}:
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+
+    def _on_error(self, error) -> None:
+        self._log(f"⚠︎ échec du lancement de yt-dlp (code {int(error)})")
+        self.btn_add.setEnabled(True)
 
     # ------------------------------------------------------------ journal --
     def _log(self, text: str) -> None:
@@ -588,8 +607,8 @@ class DownloadDialog(QDialog):
             self.btn_add.setEnabled(True)
             self.bar.setValue(100 if self.total else 0)
             self._log(
-                f"Terminé : {self.done} morceau(x) ajouté(s)"
-                + (f", {self.failed} échec(s)." if self.failed else ".")
+                f"Terminé : {self.n_done} morceau(x) ajouté(s)"
+                + (f", {self.n_failed} échec(s)." if self.n_failed else ".")
             )
             self.finished_all.emit()
             return
@@ -615,9 +634,9 @@ class DownloadDialog(QDialog):
 
     def _on_proc_finished(self, code: int, _status) -> None:
         if code == 0:
-            self.done += 1
+            self.n_done += 1
         else:
-            self.failed += 1
+            self.n_failed += 1
             self._log(f"Échec sur cette URL (code {code}).")
         # Laisse la file repartir, et signale les nouveaux morceaux.
         QTimer.singleShot(120, self._next)
@@ -1042,16 +1061,45 @@ class VideoDownloadDialog(QDialog):
         self.proc = QProcess(self)
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
         self.proc.setProcessEnvironment(process_env())
+        self._prepare_dir(self.video_dir)
         self.proc.setWorkingDirectory(str(self.video_dir))
         self.proc.readyReadStandardOutput.connect(self._on_output)
+        # Sans ce signal, un binaire introuvable ou un dossier de travail
+        # invalide ne produit AUCUN message : le bouton semble simplement ne
+        # rien faire. C'est exactement ce qui masquait le bug du dossier vidéo.
+        self.proc.errorOccurred.connect(self._on_error)
         self.proc.finished.connect(self._on_finished)
 
         self.probe = QProcess(self)
         self.probe.setProcessChannelMode(QProcess.MergedChannels)
         self.probe.setProcessEnvironment(process_env())
         self.probe.readyReadStandardOutput.connect(self._on_probe_output)
+        self.probe.errorOccurred.connect(self._on_error)
         self.probe.finished.connect(self._on_probe_finished)
         self._probe_lines: list[str] = []
+
+    @staticmethod
+    def _prepare_dir(path: Path) -> None:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+    def _on_error(self, error) -> None:
+        """Rend visible un échec de lancement, au lieu de le laisser muet."""
+        reasons = {
+            QProcess.FailedToStart: "le programme n'a pas pu démarrer",
+            QProcess.Crashed: "le programme s'est interrompu",
+            QProcess.Timedout: "délai dépassé",
+            QProcess.WriteError: "erreur d'écriture",
+            QProcess.ReadError: "erreur de lecture",
+        }
+        self._log(
+            f"⚠︎ {reasons.get(error, 'erreur inconnue')} "
+            f"(dossier : {self.video_dir})"
+        )
+        self.btn_dl.setEnabled(True)
+        self.btn_formats.setEnabled(True)
 
         self.probe = QProcess(self)
         self.probe.setProcessChannelMode(QProcess.MergedChannels)
@@ -1631,6 +1679,18 @@ class Player(QWidget):
         self.dlg.download_dir = path
         self.dlg.proc.setWorkingDirectory(str(path))
 
+    def set_video_dir(self, path: Path) -> None:
+        """Change le dossier vidéo et s'assure qu'il existe."""
+        path = Path(path)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self.video_dir = path
+        self.settings.setValue("video_dir", str(path))
+        self.vdlg.video_dir = path
+        self.vdlg.proc.setWorkingDirectory(str(path))
+
     def open_settings_dialog(self) -> None:
         dlg = SettingsDialog(self.music_dir, self.download_dir, parent=None)
         dlg.applied.connect(lambda: self._apply_settings(dlg))
@@ -1641,7 +1701,6 @@ class Player(QWidget):
     def _apply_settings(self, dlg: "SettingsDialog") -> None:
         self.set_download_dir(Path(dlg.download_dir))
         self.change_music_dir(Path(dlg.music_dir))
-
     # ---------------------------------------------------------- répétition --
     def set_repeat(self, mode: str) -> None:
         if mode not in REPEAT_ORDER:
@@ -2370,6 +2429,64 @@ def _test_video_fullscreen(w) -> tuple[bool, str]:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_video_dir_creation(w) -> tuple[bool, str]:
+    """Le dossier vidéo doit être créé même s'il n'existe pas au départ.
+
+    C'est la cause du bug « le téléchargement vidéo ne marche pas » : un
+    dossier de travail absent fait échouer le lancement de yt-dlp, sans aucun
+    message. Ce test le vérifie explicitement.
+    """
+    import tempfile
+    parent = Path(tempfile.mkdtemp(prefix="wp-vdir-"))
+    target = parent / "sous" / "dossier"      # volontairement inexistant
+    try:
+        w.set_video_dir(target)
+        created = target.is_dir()
+        wd = w.vdlg.proc.workingDirectory()
+        ok = created and wd == str(target)
+        return (ok, f"créé={created} dossier de travail={wd}")
+    finally:
+        w.set_video_dir(w.settings.value("video_dir", VIDEO_DIR_DEFAULT))
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def _test_video_download(w) -> tuple[bool, str]:
+    """Télécharge une vraie vidéo en passant par le dialogue de l'interface.
+
+    Le test précédent ne vérifiait que les arguments yt-dlp, ce qui laissait
+    passer un dossier de travail invalide : ici on exerce le chemin complet.
+    """
+    import tempfile
+    url = os.environ.get("WORKPLAY_TEST_URL")
+    if not url:
+        return (False, "aucune URL de test fournie")
+    tmp = Path(tempfile.mkdtemp(prefix="wp-vdl-"))
+    original = w.video_dir
+    try:
+        w.set_video_dir(tmp)
+        dlg = w.vdlg
+        dlg.input.setPlainText(url)
+        dlg.quality.setCurrentIndex(4)          # 360p : le plus rapide
+        dlg.start()
+        if not dlg.proc.waitForFinished(180_000):
+            dlg.proc.kill()
+            return (False, "délai dépassé")
+        # Laisse le signal de fin traiter le résultat.
+        for _ in range(20):
+            QApplication.processEvents()
+            if dlg.produced is not None:
+                break
+        produced = dlg.produced
+        size_mb = (produced.stat().st_size / 1048576) if produced else 0
+        ok = produced is not None and produced.suffix.lower() in VIDEO_EXTS and size_mb > 0.05
+        return (ok,
+                f"{produced.name if produced else 'aucun fichier'} "
+                f"({size_mb:.1f} Mo, code={dlg.proc.exitCode()})")
+    finally:
+        w.set_video_dir(original)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _pause(w) -> bool:
     w.toggle_play()
     return w.player.playbackState() == QMediaPlayer.PausedState
@@ -2487,6 +2604,8 @@ def _self_test(app: QApplication, w: "Player", url: str | None = None) -> int:
         ("vidéo : qualité → sélecteur yt-dlp", lambda: _test_video_args()),
         ("vidéo : fenêtre de lecture", lambda: _test_video_window(w)),
         ("vidéo : plein écran accessible", lambda: _test_video_fullscreen(w)),
+        ("vidéo : dossier absent créé à la volée", lambda: _test_video_dir_creation(w)),
+        ("vidéo : téléchargement réel via le dialogue", lambda: _test_video_download(w)),
         ("yt-dlp localisé", lambda: (find_ytdlp() is not None, str(find_ytdlp()))),
         ("dialogue URLs construit", lambda: (
             w.dlg is not None and w.dlg.input is not None, "champ de saisie prêt")),
@@ -2567,10 +2686,12 @@ def main() -> int:
     ).expanduser()
     saved_dl = prefs.value("download_dir")
     download_dir = Path(saved_dl).expanduser() if saved_dl else music_dir
+    saved_vid = prefs.value("video_dir")
+    video_dir = Path(saved_vid).expanduser() if saved_vid else VIDEO_DIR_DEFAULT
 
     # Au premier lancement on crée le dossier au lieu d'échouer : l'utilisateur
     # n'a qu'à y déposer ses fichiers, ou les télécharger depuis le tray.
-    for d in {music_dir, download_dir}:
+    for d in {music_dir, download_dir, video_dir}:
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -2578,6 +2699,9 @@ def main() -> int:
             return 1
 
     w = Player(music_dir, download_dir)
+    w.video_dir = video_dir
+    w.vdlg.video_dir = video_dir
+    w.vdlg.proc.setWorkingDirectory(str(video_dir))
     w.show()
     w.raise_()
     # Volontairement pas d'activateWindow() : WorkPlay ne doit jamais
