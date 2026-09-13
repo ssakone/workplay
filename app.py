@@ -22,7 +22,11 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.request
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -43,6 +47,28 @@ from PySide6.QtWidgets import (
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
+
+# Version de l'application. C'est la SEULE source de vérité côté code : le
+# bundle .app la reprend depuis workplay.spec, et tools/build.sh vérifie que
+# les deux concordent pour éviter qu'une release annonce un mauvais numéro.
+APP_VERSION = "1.3.0"
+
+# Mises à jour : dépôt public, releases GitHub.
+UPDATE_REPO = "ssakone/workplay"
+UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+
+# Identité de signature attendue. Une mise à jour qui ne porte pas CE Team ID
+# est refusée : c'est ce qui empêche d'installer un binaire substitué.
+EXPECTED_TEAM_ID = "Z64CCL2WWK"
+
+# Les versions remplacées sont conservées ici plutôt que supprimées, pour
+# pouvoir revenir en arrière si une mise à jour déplaît.
+BACKUP_DIR = (
+    Path.home() / "Library" / "Application Support" / "WorkPlay" / "versions"
+)
+
+# Nombre de versions précédentes conservées (les plus anciennes sont purgées).
+BACKUP_KEEP = 3
 
 # Dossier musical par défaut. Modifiable depuis la barre de menus ;
 # l'application le choisit elle-même, aucun chemin n'est codé en dur.
@@ -862,6 +888,518 @@ class SettingsDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- #
+# Mises à jour
+# --------------------------------------------------------------------------- #
+
+def parse_version(text: str) -> tuple[int, ...]:
+    """'v1.2.10' -> (1, 2, 10). Comparaison numérique, pas alphabétique.
+
+    Sans cela, '1.2.10' passerait pour antérieur à '1.2.9'.
+    """
+    cleaned = re.sub(r"^v", "", (text or "").strip())
+    parts = re.findall(r"\d+", cleaned)
+    return tuple(int(p) for p in parts[:4]) or (0,)
+
+
+def is_newer(candidate: str, current: str) -> bool:
+    """Vrai si `candidate` est une version strictement postérieure."""
+    return parse_version(candidate) > parse_version(current)
+
+
+def installed_app_path() -> Path | None:
+    """Chemin du bundle .app en cours d'exécution, ou None hors bundle.
+
+    En développement (app.py lancé directement), il n'y a pas de bundle :
+    la mise à jour est alors désactivée plutôt que d'opérer sur un chemin
+    fantaisiste.
+    """
+    exe = Path(sys.executable).resolve()
+    for parent in exe.parents:
+        if parent.suffix == ".app":
+            return parent
+    return None
+
+
+def verify_bundle(path: Path) -> tuple[bool, str]:
+    """Vérifie qu'un bundle téléchargé est authentique AVANT de l'installer.
+
+    Trois contrôles, dans cet ordre :
+      1. la signature de code est valide et complète ;
+      2. le Team ID est bien celui attendu — sinon n'importe quel binaire
+         signé par n'importe qui serait accepté ;
+      3. Gatekeeper l'accepte (donc la notarisation Apple est reconnue).
+    Un échec sur l'un des trois annule l'installation.
+    """
+    if not path.is_dir():
+        return (False, "bundle introuvable")
+
+    try:
+        sig = subprocess.run(
+            ["codesign", "--verify", "--deep", "--strict", str(path)],
+            capture_output=True, text=True, timeout=180,
+        )
+        if sig.returncode != 0:
+            return (False, f"signature invalide : {sig.stderr.strip()[:120]}")
+
+        info = subprocess.run(
+            ["codesign", "-dv", "--verbose=2", str(path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        blob = info.stderr + info.stdout
+        found = re.search(r"TeamIdentifier=(\S+)", blob)
+        team = found.group(1) if found else "absent"
+        if team != EXPECTED_TEAM_ID:
+            return (False, f"Team ID inattendu : {team}")
+
+        gate = subprocess.run(
+            ["spctl", "--assess", "--type", "execute", str(path)],
+            capture_output=True, text=True, timeout=180,
+        )
+        if gate.returncode != 0:
+            return (False, "refusé par Gatekeeper (non notarisé ?)")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (False, f"vérification impossible : {exc}")
+
+    return (True, f"signé {team}, notarisé")
+
+
+def backup_current(app_path: Path) -> Path | None:
+    """Archive la version installée avant de la remplacer.
+
+    Remplaçait-on l'application sans copie, la version précédente serait
+    définitivement perdue — c'est ce qui se passait jusqu'ici, puisque glisser
+    un .app dans /Applications écrase l'ancien sans rien conserver.
+    """
+    version = bundle_version(app_path) or "inconnue"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        dest = BACKUP_DIR / f"WorkPlay-{version}-{stamp}.app"
+        # ditto préserve les liens, permissions et signatures du bundle,
+        # contrairement à une copie naïve.
+        res = subprocess.run(
+            ["ditto", str(app_path), str(dest)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if res.returncode != 0 or not dest.is_dir():
+            return None
+        prune_backups()
+        return dest
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def list_backups() -> list[Path]:
+    if not BACKUP_DIR.is_dir():
+        return []
+    return sorted(
+        (p for p in BACKUP_DIR.iterdir() if p.suffix == ".app"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def prune_backups(keep: int = BACKUP_KEEP) -> int:
+    """Garde les `keep` sauvegardes les plus récentes, supprime le reste."""
+    removed = 0
+    for old in list_backups()[keep:]:
+        try:
+            shutil.rmtree(old, ignore_errors=True)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def bundle_version(app_path: Path) -> str | None:
+    """Lit CFBundleShortVersionString d'un bundle."""
+    plist = Path(app_path) / "Contents" / "Info.plist"
+    if not plist.is_file():
+        return None
+    try:
+        out = subprocess.run(
+            ["/usr/libexec/PlistBuddy", "-c",
+             "Print :CFBundleShortVersionString", str(plist)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def fetch_latest_release(timeout: int = 20) -> dict | None:
+    """Interroge l'API GitHub pour la dernière release publiée.
+
+    Renvoie None en cas de coupure réseau ou de réponse inattendue : une mise
+    à jour indisponible ne doit jamais empêcher d'écouter sa musique.
+    """
+    req = urllib.request.Request(
+        UPDATE_API,
+        headers={"Accept": "application/vnd.github+json",
+                 "User-Agent": f"WorkPlay/{APP_VERSION}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+
+    tag = data.get("tag_name")
+    if not isinstance(tag, str):
+        return None
+
+    dmg = None
+    for asset in data.get("assets") or []:
+        name = asset.get("name", "")
+        if name.endswith(".dmg"):
+            dmg = {"name": name,
+                   "url": asset.get("browser_download_url"),
+                   "size": asset.get("size", 0)}
+            break
+
+    return {
+        "tag": tag,
+        "version": re.sub(r"^v", "", tag),
+        "name": data.get("name") or tag,
+        "notes": data.get("body") or "",
+        "dmg": dmg,
+        "html_url": data.get("html_url", ""),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Dialogue « Mise à jour »
+# --------------------------------------------------------------------------- #
+
+class UpdateDialog(QDialog):
+    """Détecte, télécharge, vérifie et installe une nouvelle version.
+
+    Chaîne complète en un clic :
+      téléchargement du DMG -> montage -> vérification (signature, Team ID,
+      Gatekeeper) -> archivage de la version en place -> remplacement ->
+      relance.
+
+    Rien n'est installé avant que la vérification ait réussi, et la version
+    précédente est toujours conservée : une mise à jour ratée reste réversible.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.release: dict | None = None
+        self.dmg_path: Path | None = None
+        self.mount_point: Path | None = None
+        self.busy = False
+
+        self.setWindowTitle("Mise à jour de WorkPlay")
+        self.setMinimumWidth(560)
+        self.setStyleSheet(STYLE)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
+
+        title = QLabel("Mise à jour")
+        title.setObjectName("DlgTitle")
+        root.addWidget(title)
+
+        self.lbl_state = QLabel(f"Version installée : {APP_VERSION}")
+        self.lbl_state.setObjectName("DlgHint")
+        self.lbl_state.setWordWrap(True)
+        root.addWidget(self.lbl_state)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
+        self.bar.setTextVisible(False)
+        root.addWidget(self.bar)
+
+        self.log = QPlainTextEdit()
+        self.log.setObjectName("Log")
+        self.log.setReadOnly(True)
+        self.log.setFixedHeight(150)
+        root.addWidget(self.log)
+
+        buttons = QHBoxLayout()
+        self.btn_check = QPushButton("Rechercher")
+        self.btn_check.setObjectName("Ghost")
+        self.btn_check.clicked.connect(lambda: self.check(manual=True))
+        buttons.addWidget(self.btn_check)
+
+        self.btn_rollback = QPushButton("Revenir à la version précédente")
+        self.btn_rollback.setObjectName("Ghost")
+        self.btn_rollback.clicked.connect(self.rollback)
+        buttons.addWidget(self.btn_rollback)
+
+        buttons.addStretch(1)
+
+        self.btn_install = QPushButton("Installer")
+        self.btn_install.setObjectName("Primary")
+        self.btn_install.setEnabled(False)
+        self.btn_install.clicked.connect(self.install)
+        buttons.addWidget(self.btn_install)
+        root.addLayout(buttons)
+
+        self._refresh_rollback_button()
+
+    # ------------------------------------------------------------- journal --
+    def _log(self, text: str) -> None:
+        self.log.appendPlainText(text)
+        self.log.moveCursor(QTextCursor.End)
+
+    def _refresh_rollback_button(self) -> None:
+        saved = list_backups()
+        self.btn_rollback.setEnabled(bool(saved) and not self.busy)
+        if saved:
+            self.btn_rollback.setToolTip(
+                f"{len(saved)} version(s) conservée(s) — la plus récente : "
+                f"{saved[0].name}"
+            )
+        else:
+            self.btn_rollback.setToolTip("Aucune version précédente conservée")
+
+    # ------------------------------------------------------------ recherche --
+    def check(self, manual: bool = False) -> None:
+        """Interroge GitHub. En mode automatique, reste silencieux si à jour."""
+        if self.busy:
+            return
+        if manual:
+            self._log("Recherche d'une nouvelle version…")
+        rel = fetch_latest_release()
+        if rel is None:
+            self.lbl_state.setText(
+                f"Version installée : {APP_VERSION} — vérification impossible"
+            )
+            if manual:
+                self._log("Impossible de joindre GitHub (réseau ?).")
+            return
+
+        self.release = rel
+        if not is_newer(rel["version"], APP_VERSION):
+            self.lbl_state.setText(
+                f"WorkPlay {APP_VERSION} est à jour "
+                f"(dernière publiée : {rel['version']})."
+            )
+            self.btn_install.setEnabled(False)
+            if manual:
+                self._log("Aucune nouvelle version.")
+            return
+
+        if not rel.get("dmg") or not rel["dmg"].get("url"):
+            self.lbl_state.setText(
+                f"Version {rel['version']} publiée, mais sans image disque."
+            )
+            self._log("La release ne contient pas de .dmg installable.")
+            return
+
+        size_mb = rel["dmg"]["size"] / 1048576
+        self.lbl_state.setText(
+            f"WorkPlay {rel['version']} est disponible "
+            f"(vous avez {APP_VERSION}) — {size_mb:.0f} Mo."
+        )
+        self.btn_install.setEnabled(True)
+        self._log(f"Nouvelle version : {rel['name']}")
+        first = (rel.get("notes") or "").strip().splitlines()
+        for line in first[:6]:
+            if line.strip():
+                self._log(f"  {line.strip()[:110]}")
+
+    # ------------------------------------------------------- installation --
+    def install(self) -> None:
+        """Télécharge, vérifie, archive, remplace, relance."""
+        if self.busy or not self.release:
+            return
+        target = installed_app_path()
+        if target is None:
+            self._log(
+                "Mise à jour indisponible : WorkPlay ne tourne pas depuis un "
+                "bundle .app (mode développement)."
+            )
+            return
+
+        self.busy = True
+        self.btn_install.setEnabled(False)
+        self.btn_check.setEnabled(False)
+        self._refresh_rollback_button()
+        try:
+            self._run_install(target)
+        finally:
+            self._cleanup()
+            self.busy = False
+            self.btn_check.setEnabled(True)
+            self._refresh_rollback_button()
+
+    def _run_install(self, target: Path) -> None:
+        rel = self.release
+        assert rel is not None
+        dmg = rel["dmg"]
+
+        # 1. Téléchargement
+        self._log(f"Téléchargement de {dmg['name']}…")
+        tmp = Path(tempfile.mkdtemp(prefix="workplay-update-"))
+        self.dmg_path = tmp / dmg["name"]
+        if not self._download(dmg["url"], self.dmg_path, dmg.get("size", 0)):
+            self._log("Téléchargement interrompu.")
+            return
+
+        # 2. Montage
+        self._log("Montage de l'image disque…")
+        self.mount_point = tmp / "mnt"
+        self.mount_point.mkdir(exist_ok=True)
+        mount = subprocess.run(
+            ["hdiutil", "attach", str(self.dmg_path),
+             "-mountpoint", str(self.mount_point), "-nobrowse", "-quiet"],
+            capture_output=True, text=True, timeout=300,
+        )
+        if mount.returncode != 0:
+            self._log(f"Montage impossible : {mount.stderr.strip()[:120]}")
+            return
+
+        new_app = self.mount_point / "WorkPlay.app"
+        if not new_app.is_dir():
+            self._log("L'image ne contient pas WorkPlay.app.")
+            return
+
+        # 3. Vérification de sécurité — avant toute écriture
+        self._log("Vérification de la signature et de la notarisation…")
+        ok, detail = verify_bundle(new_app)
+        if not ok:
+            self._log(f"⚠︎ Mise à jour REFUSÉE : {detail}")
+            self._log("Rien n'a été installé.")
+            return
+        self._log(f"✓ {detail}")
+
+        found_version = bundle_version(new_app) or "?"
+        if not is_newer(found_version, APP_VERSION):
+            self._log(
+                f"L'image contient la version {found_version}, "
+                f"qui n'est pas plus récente. Abandon."
+            )
+            return
+
+        # 4. Archivage de la version en place
+        self._log("Sauvegarde de la version actuelle…")
+        saved = backup_current(target)
+        if saved is None:
+            self._log("⚠︎ Sauvegarde impossible — installation annulée.")
+            return
+        self._log(f"✓ conservée : {saved.name}")
+
+        # 5. Remplacement
+        self._log(f"Installation de la version {found_version}…")
+        staging = target.with_name("WorkPlay.app.new")
+        shutil.rmtree(staging, ignore_errors=True)
+        copy = subprocess.run(
+            ["ditto", str(new_app), str(staging)],
+            capture_output=True, text=True, timeout=900,
+        )
+        if copy.returncode != 0:
+            shutil.rmtree(staging, ignore_errors=True)
+            self._log(f"Copie échouée : {copy.stderr.strip()[:120]}")
+            return
+
+        # On échange en dernier, quand la nouvelle copie est complète : ainsi
+        # une interruption ne laisse jamais /Applications sans application.
+        try:
+            shutil.rmtree(target, ignore_errors=True)
+            staging.rename(target)
+        except OSError as exc:
+            self._log(f"Remplacement impossible : {exc}")
+            self._log(f"La version précédente reste dans {saved}")
+            return
+
+        self.bar.setValue(100)
+        self._log(f"✓ WorkPlay {found_version} installé.")
+        self._log("Redémarrage…")
+        QTimer.singleShot(1200, lambda: self._relaunch(target))
+
+    def _download(self, url: str, dest: Path, expected: int) -> bool:
+        """Télécharge en affichant la progression, sans figer l'interface."""
+        req = urllib.request.Request(
+            url, headers={"User-Agent": f"WorkPlay/{APP_VERSION}"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp, \
+                    open(dest, "wb") as out:
+                total = int(resp.headers.get("Content-Length") or expected or 0)
+                read = 0
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    read += len(chunk)
+                    if total:
+                        self.bar.setValue(min(99, int(read * 100 / total)))
+                    QApplication.processEvents()
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            self._log(f"Erreur de téléchargement : {exc}")
+            return False
+        return dest.is_file() and dest.stat().st_size > 0
+
+    def _relaunch(self, app_path: Path) -> None:
+        subprocess.Popen(["open", "-n", str(app_path)])
+        QApplication.quit()
+
+    # ---------------------------------------------------------- rollback --
+    def rollback(self) -> None:
+        """Restaure la sauvegarde la plus récente."""
+        if self.busy:
+            return
+        saved = list_backups()
+        target = installed_app_path()
+        if not saved:
+            self._log("Aucune version précédente conservée.")
+            return
+        if target is None:
+            self._log("Restauration indisponible hors bundle .app.")
+            return
+
+        previous = saved[0]
+        version = bundle_version(previous) or "?"
+        self.busy = True
+        try:
+            self._log(f"Restauration de la version {version}…")
+            staging = target.with_name("WorkPlay.app.rollback")
+            shutil.rmtree(staging, ignore_errors=True)
+            res = subprocess.run(
+                ["ditto", str(previous), str(staging)],
+                capture_output=True, text=True, timeout=900,
+            )
+            if res.returncode != 0:
+                shutil.rmtree(staging, ignore_errors=True)
+                self._log("Copie de la sauvegarde impossible.")
+                return
+            shutil.rmtree(target, ignore_errors=True)
+            staging.rename(target)
+            self._log(f"✓ Version {version} restaurée. Redémarrage…")
+            QTimer.singleShot(1200, lambda: self._relaunch(target))
+        except OSError as exc:
+            self._log(f"Restauration impossible : {exc}")
+        finally:
+            self.busy = False
+            self._refresh_rollback_button()
+
+    # ------------------------------------------------------------ nettoyage --
+    def _cleanup(self) -> None:
+        if self.mount_point and self.mount_point.exists():
+            subprocess.run(["hdiutil", "detach", str(self.mount_point),
+                            "-quiet", "-force"],
+                           capture_output=True, timeout=120)
+        if self.dmg_path:
+            shutil.rmtree(self.dmg_path.parent, ignore_errors=True)
+        self.mount_point = None
+        self.dmg_path = None
+
+    def closeEvent(self, e) -> None:
+        if self.busy:
+            e.ignore()
+            self.hide()
+            return
+        self._cleanup()
+        super().closeEvent(e)
+
+
+# --------------------------------------------------------------------------- #
 # Fenêtre vidéo
 # --------------------------------------------------------------------------- #
 
@@ -1467,6 +2005,11 @@ class Player(QWidget):
         if self.tracks:
             QTimer.singleShot(150, lambda: self.play_index(0))
 
+        # Vérification des mises à jour, après le démarrage pour ne pas
+        # retarder la lecture. Désactivable pour les tests.
+        if not os.environ.get("WORKPLAY_NO_UPDATE_CHECK"):
+            QTimer.singleShot(4000, self.check_updates_silently)
+
     # ------------------------------------------------------------- flags ---
     @staticmethod
     def _flags(on_top: bool):
@@ -1749,6 +2292,11 @@ class Player(QWidget):
         self.act_top.triggered.connect(self.set_always_on_top)
         menu.addSeparator()
 
+        self.act_update = menu.addAction("Rechercher une mise à jour…")
+        self.act_update.triggered.connect(self.open_update_dialog)
+
+        menu.addSeparator()
+
         act_quit = menu.addAction("Quitter")
         act_quit.triggered.connect(self.quit_app)
 
@@ -1780,6 +2328,31 @@ class Player(QWidget):
         self.dlg.finished_all.connect(self._after_downloads)
         self.vdlg = VideoDownloadDialog(self.video_dir, parent=None)
         self.vdlg.finished_ok.connect(self._on_video_downloaded)
+        self.udlg = UpdateDialog(parent=None)
+
+    def open_update_dialog(self) -> None:
+        self.udlg.show()
+        self.udlg.raise_()
+        self.udlg.activateWindow()   # action volontaire de l'utilisateur
+        self.udlg.check(manual=True)
+
+    def check_updates_silently(self) -> None:
+        """Vérifie au démarrage et prévient seulement s'il y a du nouveau.
+
+        Une notification discrète suffit : rien ne s'installe sans que vous
+        l'ayez demandé, et l'absence de réseau passe inaperçue.
+        """
+        rel = fetch_latest_release()
+        if rel is None or not is_newer(rel["version"], APP_VERSION):
+            return
+        self.tray.showMessage(
+            f"WorkPlay {rel['version']} est disponible",
+            "Barre de menus → Rechercher une mise à jour… pour l'installer.",
+            QSystemTrayIcon.Information, 8000,
+        )
+        self.act_update.setText(
+            f"Mettre à jour vers {rel['version']}…"
+        )
 
     def open_video_download(self) -> None:
         self.vdlg.show()
@@ -2689,6 +3262,127 @@ def _test_video_dir_creation(w) -> tuple[bool, str]:
         shutil.rmtree(parent, ignore_errors=True)
 
 
+def _test_version_compare() -> tuple[bool, str]:
+    """La comparaison doit être numérique, pas alphabétique."""
+    cases = [
+        ("1.3.0", "1.2.1", True),
+        ("v1.2.10", "1.2.9", True),      # piege classique du tri texte
+        ("1.2.1", "1.2.1", False),
+        ("1.2.0", "1.2.1", False),
+        ("2.0.0", "1.9.9", True),
+    ]
+    bad = [f"{a} vs {b}" for a, b, want in cases if is_newer(a, b) != want]
+    return (not bad, f"{len(cases)} cas, échecs={bad or 'aucun'}")
+
+
+def _test_fetch_release() -> tuple[bool, str]:
+    """L'API GitHub répond et expose un .dmg téléchargeable."""
+    rel = fetch_latest_release()
+    if rel is None:
+        return (False, "API injoignable (réseau ?)")
+    has_dmg = bool(rel.get("dmg") and rel["dmg"].get("url"))
+    return (bool(rel.get("version")) and has_dmg,
+            f"dernière={rel['version']} dmg={rel['dmg']['name'] if has_dmg else 'absent'}")
+
+
+def _test_backup() -> tuple[bool, str]:
+    """Archiver un bundle doit produire une copie complète et lisible."""
+    global BACKUP_DIR
+    original = BACKUP_DIR
+    tmp = Path(tempfile.mkdtemp(prefix="wp-bk-"))
+    try:
+        BACKUP_DIR = tmp / "versions"
+        fake = tmp / "WorkPlay.app"
+        (fake / "Contents").mkdir(parents=True)
+        (fake / "Contents" / "Info.plist").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0"><dict>'
+            '<key>CFBundleShortVersionString</key><string>9.9.9</string>'
+            '</dict></plist>\n', encoding="utf-8"
+        )
+        (fake / "Contents" / "marqueur.txt").write_text("contenu", encoding="utf-8")
+        saved = backup_current(fake)
+        ok = (saved is not None and saved.is_dir()
+              and (saved / "Contents" / "marqueur.txt").is_file()
+              and "9.9.9" in saved.name)
+        return (ok, f"archive={saved.name if saved else 'aucune'}")
+    finally:
+        BACKUP_DIR = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_prune() -> tuple[bool, str]:
+    """Seules les N sauvegardes les plus récentes sont conservées."""
+    global BACKUP_DIR
+    original = BACKUP_DIR
+    tmp = Path(tempfile.mkdtemp(prefix="wp-pr-"))
+    try:
+        BACKUP_DIR = tmp / "versions"
+        BACKUP_DIR.mkdir(parents=True)
+        import time
+        for i in range(6):
+            d = BACKUP_DIR / f"WorkPlay-1.0.{i}-2026.app"
+            d.mkdir()
+            (d / "x").write_text(str(i), encoding="utf-8")
+            time.sleep(0.02)          # horodatages distincts
+        removed = prune_backups(keep=3)
+        left = list_backups()
+        return (len(left) == 3 and removed == 3,
+                f"{removed} purgée(s), {len(left)} conservée(s)")
+    finally:
+        BACKUP_DIR = original
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_verify_rejects() -> tuple[bool, str]:
+    """Un bundle non signé doit être REFUSÉ.
+
+    C'est le test de sécurité le plus important : sans ce refus, l'updater
+    installerait n'importe quel fichier téléchargé.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="wp-fake-"))
+    try:
+        fake = tmp / "WorkPlay.app"
+        (fake / "Contents" / "MacOS").mkdir(parents=True)
+        (fake / "Contents" / "MacOS" / "WorkPlay").write_text(
+            "#!/bin/sh\necho pirate\n", encoding="utf-8"
+        )
+        ok, detail = verify_bundle(fake)
+        # Le résultat ATTENDU est un refus.
+        return (not ok, f"refusé comme prévu : {detail[:70]}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_verify_accepts() -> tuple[bool, str]:
+    """Le bundle réellement installé doit passer la vérification."""
+    installed = Path("/Applications/WorkPlay.app")
+    if not installed.is_dir():
+        return (True, "aucune app installée — test sans objet")
+    ok, detail = verify_bundle(installed)
+    return (ok, detail[:80])
+
+
+def _test_version_sync() -> tuple[bool, str]:
+    """APP_VERSION doit correspondre à la version du spec de build.
+
+    Sans ce contrôle, l'application pourrait annoncer une version différente
+    de celle du bundle et se croire éternellement à jour (ou l'inverse).
+    """
+    spec = Path(__file__).parent / "workplay.spec"
+    if not spec.is_file():
+        return (True, "spec absent — test sans objet")
+    found = re.search(
+        r'CFBundleShortVersionString"\s*:\s*"([^"]+)"',
+        spec.read_text(encoding="utf-8"),
+    )
+    spec_version = found.group(1) if found else "?"
+    return (spec_version == APP_VERSION,
+            f"code={APP_VERSION} spec={spec_version}")
+
+
 def _test_video_zoom(w) -> tuple[bool, str]:
     """Le zoom agrandit l'image SANS la rogner, et l'ajustement la remet.
 
@@ -2893,6 +3587,17 @@ def _self_test(app: QApplication, w: "Player", url: str | None = None) -> int:
             (w.set_always_on_top(False),
              not (w.windowFlags() & Qt.WindowStaysOnTopHint))[1], "drapeau retiré")),
         ("vidéo : zoom sans rognage", lambda: _test_video_zoom(w)),
+        # --- mises à jour ----------------------------------------------------
+        ("maj : comparaison de versions", lambda: _test_version_compare()),
+        ("maj : release GitHub lisible", lambda: _test_fetch_release()),
+        ("maj : sauvegarde de la version en place", lambda: _test_backup()),
+        ("maj : purge des vieilles sauvegardes", lambda: _test_prune()),
+        ("maj : bundle non signé REFUSÉ", lambda: _test_verify_rejects()),
+        ("maj : bundle installé accepté", lambda: _test_verify_accepts()),
+        ("maj : version du code = version du bundle", lambda: _test_version_sync()),
+        ("maj : dialogue construit", lambda: (
+            w.udlg is not None and hasattr(w.udlg, "btn_install"),
+            f"version annoncée = {APP_VERSION}")),
         ("tray icon présent", lambda: (
             w.tray is not None and w.tray.isVisible(), "icône affichée")),
         ("menu tray complet", lambda: (

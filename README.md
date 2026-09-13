@@ -73,10 +73,18 @@ plan** dans la barre de menus suffit — et ce geste est le vôtre.
   titre, rechargement à chaud quand des fichiers apparaissent dans le dossier.
 - **Aucune connexion réseau** en dehors des téléchargements que vous demandez
   explicitement. Pas de télémétrie, pas de compte, pas de publicité.
-- **Auto-test intégré** — 46 vérifications instrumentées des contrôles, du
+- **Mise à jour en un clic** — WorkPlay surveille les releases GitHub et vous
+  prévient discrètement quand une version est disponible. Un clic télécharge,
+  **vérifie la signature et la notarisation**, archive la version en place puis
+  installe et redémarre. Rien ne s'installe sans votre accord.
+- **Les versions précédentes sont conservées** — les trois dernières sont
+  archivées dans `~/Library/Application Support/WorkPlay/versions/`, et un
+  bouton **Revenir à la version précédente** les restaure. Une mise à jour qui
+  déplaît reste réversible.
+- **Auto-test intégré** — 54 vérifications instrumentées des contrôles, du
   tray, de l'absence de vol de focus, des playlists, des modes de répétition,
-  des réglages, de la fenêtre vidéo, du codec produit et du téléchargement
-  réel.
+  des réglages, de la fenêtre vidéo, du codec produit, de la chaîne de mise à
+  jour et du téléchargement réel.
 
 ## Installation
 
@@ -263,10 +271,45 @@ Dès que le téléchargement est terminé, la fenêtre vidéo s'ouvre.
 Barre de menus → **Ouvrir une vidéo…** pour revoir un fichier déjà téléchargé
 (dossier par défaut `~/Movies/WorkPlay`).
 
+### Mettre à jour
+
+WorkPlay vérifie au démarrage s'il existe une version plus récente et affiche
+une notification le cas échéant. Vous pouvez aussi le demander à tout moment :
+barre de menus → **Rechercher une mise à jour…**.
+
+Le bouton **Installer** enchaîne tout : téléchargement, vérification, archivage
+de la version en place, remplacement, redémarrage. Aucune autre action n'est
+demandée.
+
+**Ce qui est vérifié avant d'installer**, dans cet ordre — un seul échec annule
+tout, sans rien écrire sur le disque :
+
+1. la signature de code est valide et complète (`codesign --verify --deep
+   --strict`) ;
+2. le **Team ID** correspond à celui attendu, sinon n'importe quel binaire
+   signé par n'importe qui serait accepté ;
+3. **Gatekeeper** accepte le bundle, donc la notarisation Apple est reconnue ;
+4. la version contenue dans l'image est bien plus récente que l'actuelle.
+
+**Revenir en arrière.** Les trois dernières versions remplacées sont conservées
+dans `~/Library/Application Support/WorkPlay/versions/`. Le bouton **Revenir à
+la version précédente** restaure la plus récente et redémarre l'application.
+
+> Jusqu'à la version 1.2.1, installer une nouvelle version écrasait la
+> précédente sans en garder de copie — comportement normal d'un glisser-déposer
+> dans `/Applications`, mais sans retour possible. L'archivage corrige cela.
+
+Pour désactiver la vérification au démarrage :
+
+```bash
+WORKPLAY_NO_UPDATE_CHECK=1 ./.venv/bin/python app.py
+```
+
 ## Configuration
 | Variable d'environnement | Effet |
 |---|---|
 | `WORKPLAY_DIR` | Dossier musical (prioritaire sur le choix mémorisé) |
+| `WORKPLAY_NO_UPDATE_CHECK=1` | Désactive la vérification des mises à jour |
 | `WORKPLAY_DEBUG=1` | Trace la géométrie, l'état de lecture et l'épinglage |
 | `WORKPLAY_SELFTEST=1` | Lance l'auto-test et affiche le rapport, puis quitte |
 | `WORKPLAY_TEST_URL` | URL utilisée par le test de téléchargement réel |
