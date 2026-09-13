@@ -20,6 +20,7 @@ import os
 import re
 import json
 import shutil
+import subprocess
 import sys
 from collections import deque
 from pathlib import Path
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QDialog,
     QPlainTextEdit, QProgressBar, QMenu, QSystemTrayIcon,
     QGraphicsDropShadowEffect, QFileDialog, QCheckBox, QComboBox, QInputDialog,
+    QScrollArea,
 )
 
 # --------------------------------------------------------------------------- #
@@ -86,27 +88,71 @@ VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 EXTRA_PATHS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
 
 # --- Téléchargement vidéo --------------------------------------------------
-# Qualités proposées. Le sélecteur yt-dlp prend le meilleur flux compatible
-# avec la limite demandée, puis ffmpeg fusionne vidéo et audio en MP4.
+# Qualités proposées. Chaque sélecteur privilégie le couple H.264 + AAC, que
+# macOS décode nativement, et ne retombe sur un autre codec que si la source
+# n'offre rien d'autre.
+#
+# POURQUOI : YouTube propose par défaut de l'AV1, souvent choisi comme
+# « meilleure qualité ». Or le décodeur AV1 de Qt n'a pas de décodage matériel
+# ici et reste bloqué en BufferingMedia — son audible, image noire, aucune
+# erreur signalée. H.264 évite complètement ce piège.
+
+def _video_selector(height: int | None) -> str:
+    res = f"[height<={height}]" if height else ""
+    optimized = f"bv*{res}[vcodec^=avc1]+ba[acodec^=mp4a]"
+    fallback = f"bv*{res}+ba/b{res}"
+    return f"{optimized}/{fallback}"
+
+
 VIDEO_QUALITY_PRESETS = [
-    ("Meilleure qualité", "bv*+ba/b"),
-    ("1080p", "bv*[height<=1080]+ba/b[height<=1080]"),
-    ("720p", "bv*[height<=720]+ba/b[height<=720]"),
-    ("480p", "bv*[height<=480]+ba/b[height<=480]"),
-    ("360p (léger)", "bv*[height<=360]+ba/b[height<=360]"),
+    ("Meilleure qualité", _video_selector(None)),
+    ("1080p", _video_selector(1080)),
+    ("720p", _video_selector(720)),
+    ("480p", _video_selector(480)),
+    ("360p (léger)", _video_selector(360)),
 ]
 
 
 def video_download_args(selector: str) -> list[str]:
-    """Arguments yt-dlp pour une vidéo, avec fusion en MP4."""
+    """Arguments yt-dlp pour une vidéo, fusionnée en MP4."""
     return [
         "-f", selector,
         "--merge-output-format", "mp4",
+        # Sans cela, yt-dlp peut produire du MP4 contenant de l'AV1 ou de
+        # l'Opus, illisibles par le moteur de Qt.
+        "--remux-video", "mp4",
         "--newline",
         "--ignore-errors",
         "--no-overwrites",
         "-o", "%(title)s.%(ext)s",
     ]
+
+
+def probe_video_codec(path: Path) -> str | None:
+    """Renvoie le codec de la piste vidéo d'un fichier, ou None.
+
+    Sert à détecter après coup une vidéo que Qt ne saura pas décoder.
+    """
+    ffprobe = shutil.which("ffprobe") or next(
+        (str(Path(b) / "ffprobe") for b in EXTRA_PATHS
+         if (Path(b) / "ffprobe").exists()), None
+    )
+    if not ffprobe or not Path(path).is_file():
+        return None
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        return out or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+# Codecs que le moteur multimédia de Qt décode de façon fiable sous macOS.
+PLAYABLE_VIDEO_CODECS = {"h264", "hevc", "mpeg4", "vp8", "vp9", "mjpeg"}
 
 
 YTDLP_ARGS = [
@@ -848,8 +894,31 @@ class VideoWindow(QWidget):
 
         self.video = QVideoWidget()
         self.video.setStyleSheet("background-color: #000000;")
-        root.addWidget(self.video, 1)
+        self.video.setMinimumSize(320, 180)
+        # Proportions toujours respectées : on ne rogne ni n'étire l'image.
+        self.video.setAspectRatioMode(Qt.KeepAspectRatio)
 
+        # Zone défilante : au-delà de la fenêtre, on zoome ET on se déplace
+        # dans l'image, au lieu d'en perdre une partie.
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(self.video)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setAlignment(Qt.AlignCenter)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setStyleSheet(
+            "QScrollArea{background:#000;border:none;}"
+            "QScrollBar{background:#1a1a1f;width:10px;height:10px;}"
+            "QScrollBar::handle{background:#4a4a55;border-radius:5px;}"
+        )
+        root.addWidget(self.scroll, 1)
+
+        # REMARQUE IMPORTANTE SUR L'ORDRE
+        #   Attacher la sortie vidéo avant que le widget soit réalisé à
+        #   l'écran laisse un écran noir : Qt crée alors un « sink » qui n'est
+        #   relié à aucune surface native. Le symptôme est trompeur, car le son
+        #   joue et l'état reste PlayingState sans la moindre erreur.
+        #   On attache donc de nouveau dans showEvent(), une fois la fenêtre
+        #   réellement affichée.
         self.player.setVideoOutput(self.video)
 
         # --- Barre de contrôle, masquée en plein écran -----------------------
@@ -870,10 +939,31 @@ class VideoWindow(QWidget):
         self.btn_play.setStyleSheet("color:#f2f2f7;background:transparent;border:none;")
         bar.addWidget(self.btn_play)
 
+        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out.setFixedSize(26, 22)
+        self.btn_zoom_out.setToolTip("Réduire  (molette vers le bas)")
+        self.btn_zoom_out.clicked.connect(lambda: self.zoom_by(1 / 1.25))
+        self.btn_zoom_out.setStyleSheet("color:#f2f2f7;background:transparent;border:none;")
+        bar.addWidget(self.btn_zoom_out)
+
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setFixedSize(26, 22)
+        self.btn_zoom_in.setToolTip("Agrandir  (molette vers le haut)")
+        self.btn_zoom_in.clicked.connect(lambda: self.zoom_by(1.25))
+        self.btn_zoom_in.setStyleSheet("color:#f2f2f7;background:transparent;border:none;")
+        bar.addWidget(self.btn_zoom_in)
+
+        self.lbl_zoom = QLabel("")
+        self.lbl_zoom.setFixedWidth(42)
+        self.lbl_zoom.setStyleSheet(
+            "color:rgba(235,235,245,180);font-size:11px;"
+        )
+        bar.addWidget(self.lbl_zoom)
+
         self.btn_fit = QPushButton("⇱")
         self.btn_fit.setFixedSize(26, 22)
-        self.btn_fit.setToolTip("Ajuster à la taille de la fenêtre  (A)")
-        self.btn_fit.clicked.connect(self.toggle_fit)
+        self.btn_fit.setToolTip("Ajuster l'image entière  (A)")
+        self.btn_fit.clicked.connect(self.fit_video)
         self.btn_fit.setStyleSheet("color:#f2f2f7;background:transparent;border:none;")
         bar.addWidget(self.btn_fit)
 
@@ -896,13 +986,37 @@ class VideoWindow(QWidget):
         # Raccourcis : la fenêtre a le focus, ils sont donc fiables.
         QShortcut(QKeySequence(Qt.Key_Space), self, self.toggle_play)
         QShortcut(QKeySequence(Qt.Key_F), self, self.toggle_fullscreen)
-        QShortcut(QKeySequence(Qt.Key_A), self, self.toggle_fit)
+        QShortcut(QKeySequence(Qt.Key_A), self, self.fit_video)
         QShortcut(QKeySequence(Qt.Key_Escape), self, self._escape)
 
-        self.fit_to_window = False
+        self.zoom = 1.0
         self._sync_button()
 
+        # Bandeau d'avertissement, masqué par défaut.
+        self.warning = QLabel("")
+        self.warning.setWordWrap(True)
+        self.warning.setStyleSheet(
+            "background: rgba(255,138,76,225); color:#16161b;"
+            "font-size:12px; font-weight:600; padding:8px 12px;"
+        )
+        self.warning.hide()
+        root.insertWidget(0, self.warning)
+
+    def warn(self, message: str) -> None:
+        """Affiche un avertissement lisible au-dessus de l'image."""
+        self.warning.setText(message)
+        self.warning.show()
+
     # ------------------------------------------------------------ contrôle --
+    def showEvent(self, e) -> None:
+        """Ré-attache la sortie vidéo une fois la fenêtre réalisée.
+
+        C'est le correctif de l'écran noir : sans ce second attachement, le
+        rendu reste sans surface native et n'affiche rien.
+        """
+        super().showEvent(e)
+        self.player.setVideoOutput(self.video)
+
     def toggle_play(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
@@ -915,14 +1029,63 @@ class VideoWindow(QWidget):
         self.btn_play.setText("❚❚" if playing else "▶")
 
     def toggle_fit(self) -> None:
-        """Alterne entre taille d'origine et remplissage de la fenêtre."""
-        self.fit_to_window = not self.fit_to_window
-        if self.fit_to_window:
-            self.video.setAspectRatioMode(Qt.KeepAspectRatioByExpanding)
-            self.btn_fit.setToolTip("Taille d'origine  (A)")
+        """Montre l'image entière, sans rogner.
+
+        C'est le comportement par défaut : une vidéo rognée est plus
+        déroutante qu'une image un peu plus petite. Pour voir un détail, on
+        zoome explicitement, et la zone défilante permet alors de s'y déplacer.
+        """
+        self.zoom = 1.0
+        self._apply_zoom()
+
+    def fit_video(self) -> None:
+        """Alias lisible de l'ajustement."""
+        self.toggle_fit()
+
+    def zoom_by(self, factor: float) -> None:
+        """Agrandit ou réduit l'image, sans jamais la rogner par accident."""
+        self.zoom = max(1.0, min(6.0, self.zoom * factor))
+        self._apply_zoom()
+
+    def _apply_zoom(self) -> None:
+        vw, vh = self._source_size()
+        if self.zoom <= 1.0 or not vw:
+            # Ajusté : le widget suit la zone, Qt centre et garde les
+            # proportions. Rien n'est coupé.
+            self.scroll.setWidgetResizable(True)
+            self.video.setMinimumSize(320, 180)
+            self.video.setMaximumSize(16777215, 16777215)
         else:
-            self.video.setAspectRatioMode(Qt.KeepAspectRatio)
-            self.btn_fit.setToolTip("Ajuster à la taille de la fenêtre  (A)")
+            # Zoomé : taille fixe = taille source x facteur, défilement actif.
+            self.scroll.setWidgetResizable(False)
+            self.video.setFixedSize(int(vw * self.zoom), int(vh * self.zoom))
+        self.lbl_zoom.setText(
+            "" if abs(self.zoom - 1.0) < 0.01 else f"{self.zoom:.2f}×"
+        )
+
+    def _source_size(self) -> tuple[int, int]:
+        """Dimensions de référence pour le zoom.
+
+        On préfère la taille réelle de la vidéo ; si Qt ne l'a pas encore
+        annoncée, on retombe sur la taille affichée pour que le zoom agisse
+        immédiatement au lieu de rester sans effet.
+        """
+        sink = self.player.videoSink()
+        size = sink.videoSize() if sink else None
+        if size is not None and size.isValid() and size.width() > 0:
+            return size.width(), size.height()
+        w, h = self.video.width(), self.video.height()
+        return (w, h) if w > 0 and h > 0 else (0, 0)
+
+    def wheelEvent(self, e) -> None:
+        """Molette : agrandir / réduire, comme sur une carte."""
+        delta = e.angleDelta().y()
+        if delta > 0:
+            self.zoom_by(1.25)
+        elif delta < 0:
+            self.zoom_by(1 / 1.25)
+        else:
+            super().wheelEvent(e)
 
     def toggle_fullscreen(self) -> None:
         """Plein écran aller/retour, avec barre de contrôle masquée."""
@@ -1232,7 +1395,7 @@ class Player(QWidget):
         self.expanded = False
 
         self.settings = QSettings("com.m5max", "WorkPlay")
-        self.always_on_top = self.settings.value("always_on_top", True, type=bool)
+        self.always_on_top = self.settings.value("always_on_top", False, type=bool)
         self.repeat = self.settings.value("repeat", REPEAT_OFF)
         if self.repeat not in REPEAT_ORDER:
             self.repeat = REPEAT_OFF
@@ -1290,9 +1453,21 @@ class Player(QWidget):
             self.show()
         self.raise_()
 
+    def _persist(self) -> None:
+        """Force l'écriture immédiate des réglages sur disque.
+
+        QSettings met les écritures en tampon et ne les enregistre qu'à sa
+        destruction. Comme l'application se ferme souvent par un quit() ou un
+        kill, rien n'arrivait sur le disque : le fichier restait vide, et le
+        volume, la position, le mode de répétition et les dossiers étaient
+        perdus à chaque lancement.
+        """
+        self.settings.sync()
+
     def set_always_on_top(self, on: bool) -> None:
         self.always_on_top = bool(on)
         self.settings.setValue("always_on_top", self.always_on_top)
+        self._persist()
         was_visible = self.isVisible()
         self.setWindowFlags(self._flags(self.always_on_top))
         if was_visible:
@@ -1342,15 +1517,6 @@ class Player(QWidget):
         titles.addWidget(self.lbl_title)
         titles.addWidget(self.lbl_artist)
         row1.addLayout(titles, 1)
-
-        self.btn_pin = QPushButton("📌")
-        self.btn_pin.setObjectName("Mini")
-        self.btn_pin.setCheckable(True)
-        self.btn_pin.setChecked(self.always_on_top)
-        self.btn_pin.setFixedSize(20, 20)
-        self.btn_pin.setToolTip("Toujours au premier plan (⌘⇧T)")
-        self.btn_pin.toggled.connect(self.set_always_on_top)
-        row1.addWidget(self.btn_pin, 0, Qt.AlignTop)
 
         self.btn_dl = QPushButton("＋")
         self.btn_dl.setObjectName("Mini")
@@ -1548,7 +1714,6 @@ class Player(QWidget):
         self.act_top.setCheckable(True)
         self.act_top.setChecked(self.always_on_top)
         self.act_top.triggered.connect(self.set_always_on_top)
-
         menu.addSeparator()
 
         act_quit = menu.addAction("Quitter")
@@ -1627,6 +1792,7 @@ class Player(QWidget):
             return
         self.music_dir = new_dir
         self.settings.setValue("music_dir", str(new_dir))
+        self._persist()
         # Le dialogue de téléchargement doit écrire dans le nouveau dossier.
         self.dlg.music_dir = new_dir
         self.dlg.proc.setWorkingDirectory(str(new_dir))
@@ -1676,6 +1842,7 @@ class Player(QWidget):
     def set_download_dir(self, path: Path) -> None:
         self.download_dir = path
         self.settings.setValue("download_dir", str(path))
+        self._persist()
         self.dlg.download_dir = path
         self.dlg.proc.setWorkingDirectory(str(path))
 
@@ -1688,6 +1855,7 @@ class Player(QWidget):
             pass
         self.video_dir = path
         self.settings.setValue("video_dir", str(path))
+        self._persist()
         self.vdlg.video_dir = path
         self.vdlg.proc.setWorkingDirectory(str(path))
 
@@ -1707,6 +1875,7 @@ class Player(QWidget):
             mode = REPEAT_OFF
         self.repeat = mode
         self.settings.setValue("repeat", mode)
+        self._persist()
         glyph, tip = REPEAT_LABEL[mode]
         self.btn_repeat.setText(glyph)
         self.btn_repeat.setToolTip(tip + "  (R)")
@@ -1814,6 +1983,10 @@ class Player(QWidget):
         self.video_win = VideoWindow(path, self.player, self)
         self.video_win.closed.connect(self._on_video_closed)
         self.video_win.show()
+        # Force la création de la fenêtre native, puis ré-attache le rendu :
+        # c'est ce qui fait la différence entre une image et un écran noir.
+        self.video_win.video.winId()
+        self.player.setVideoOutput(self.video_win.video)
         self.video_win.raise_()
 
     def close_video(self) -> None:
@@ -1833,12 +2006,17 @@ class Player(QWidget):
         )
 
     def play_video(self, path: Path) -> None:
-        """Bascule la lecture sur une vidéo et ouvre la fenêtre d'image."""
-        self.player.setSource(QUrl.fromLocalFile(str(path)))
-        self.player.play()
+        """Bascule la lecture sur une vidéo et ouvre la fenêtre d'image.
+
+        L'ordre compte : la fenêtre (donc la surface de rendu) doit exister et
+        être affichée AVANT que la source soit chargée, sinon la première image
+        n'est jamais rendue.
+        """
         self.lbl_title.setText(path.stem)
         self.lbl_artist.setText(f"vidéo · {path.name}")
         self.open_video(path)
+        self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.player.play()
 
     def open_video_picker(self) -> None:
         """Choisit une vidéo parmi celles du dossier vidéo."""
@@ -1895,6 +2073,7 @@ class Player(QWidget):
         self.player.durationChanged.connect(self._on_duration)
         self.player.playbackStateChanged.connect(self._on_state)
         self.player.mediaStatusChanged.connect(self._on_status)
+        self.player.mediaStatusChanged.connect(self._on_media_status_video)
 
     # ------------------------------------------------------------ lecture --
     def play_index(self, i: int) -> None:
@@ -1981,6 +2160,32 @@ class Player(QWidget):
         if status == QMediaPlayer.EndOfMedia:
             self.next_track()
 
+    def _watch_video_decode(self) -> None:
+        """Détecte une vidéo que le moteur ne sait pas décoder.
+
+        Le symptôme est trompeur : la lecture semble démarrer, le son joue,
+        mais l'image reste noire et aucune erreur n'est signalée. Qt reste
+        bloqué en BufferingMedia. C'est ce qui se produisait avec les vidéos
+        AV1 ; mieux vaut le dire que laisser un écran noir.
+        """
+        if self.video_win is None:
+            return
+        if self.player.mediaStatus() == QMediaPlayer.BufferingMedia \
+                and self.player.position() == 0 \
+                and self.player.playbackState() == QMediaPlayer.PlayingState:
+            codec = probe_video_codec(self.video_win.path)
+            if codec and codec.lower() not in PLAYABLE_VIDEO_CODECS:
+                self.video_win.warn(
+                    f"Ce moteur ne décode pas la vidéo « {codec.upper()} ».\n"
+                    "Télécharge la vidéo à nouveau : la qualité H.264 est "
+                    "maintenant privilégiée."
+                )
+
+    def _on_media_status_video(self, status) -> None:
+        if self.video_win is not None and status == QMediaPlayer.BufferingMedia:
+            # Laisse une chance au tampon, puis conclut si rien n'arrive.
+            QTimer.singleShot(4000, self._watch_video_decode)
+
     def _seek_start(self) -> None:
         self._seeking = True
 
@@ -1994,6 +2199,7 @@ class Player(QWidget):
     def _set_volume(self, v: int) -> None:
         self.audio.setVolume(v / 100.0)
         self.settings.setValue("volume", v)
+        self._persist()
         self.btn_vol.setText("🔇" if v == 0 else ("🔉" if v < 50 else "🔊"))
 
     def _toggle_mute(self) -> None:
@@ -2025,6 +2231,7 @@ class Player(QWidget):
     def mouseReleaseEvent(self, e) -> None:
         self._drag_offset = None
         self.settings.setValue("pos", self.pos())
+        self._persist()
 
     def mouseDoubleClickEvent(self, e) -> None:
         self.toggle_play()
@@ -2051,8 +2258,6 @@ class Player(QWidget):
                 self.btn_list.setChecked(False)
             else:
                 self.hide()
-        elif key == Qt.Key_T and mods & (Qt.ControlModifier | Qt.MetaModifier):
-            self.set_always_on_top(not self.always_on_top)
         else:
             super().keyPressEvent(e)
 
@@ -2060,6 +2265,7 @@ class Player(QWidget):
         self.settings.setValue("pos", self.pos())
         self.player.stop()
         self.close_video()
+        self._persist()
         self.tray.hide()
         # Ferme aussi le dialogue de téléchargement s'il tourne encore.
         self.dlg.proc.kill()
@@ -2450,6 +2656,81 @@ def _test_video_dir_creation(w) -> tuple[bool, str]:
         shutil.rmtree(parent, ignore_errors=True)
 
 
+def _test_video_zoom(w) -> tuple[bool, str]:
+    """Le zoom agrandit l'image SANS la rogner, et l'ajustement la remet.
+
+    C'est le correctif du « on ne voit qu'une partie de la vidéo » :
+    KeepAspectRatioByExpanding remplissait la fenêtre en coupant les bords.
+    """
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="wp-zoom-"))
+    try:
+        ff = find_ffmpeg()
+        if ff is None:
+            return (False, "ffmpeg absent")
+        out = tmp / "z.mp4"
+        proc = QProcess()
+        proc.start(ff, ["-f", "lavfi", "-i", "testsrc=size=640x360:rate=15",
+                        "-t", "3", "-pix_fmt", "yuv420p", "-y", str(out)])
+        proc.waitForFinished(60_000)
+        if not out.exists():
+            return (False, "génération du mp4 impossible")
+        w.open_video(out)
+        win = w.video_win
+        # Le mode de rendu ne doit jamais rogner.
+        no_crop = win.video.aspectRatioMode() != Qt.KeepAspectRatioByExpanding
+        initial = win.zoom
+        win.zoom_by(1.25)
+        zoomed = win.zoom > initial
+        scrollable = not win.scroll.widgetResizable()
+        win.fit_video()
+        fitted = abs(win.zoom - 1.0) < 0.01 and win.scroll.widgetResizable()
+        w.close_video()
+        ok = no_crop and zoomed and fitted
+        return (ok, f"sans rognage={no_crop} zoom={zoomed} "
+                    f"défilement au zoom={scrollable} "
+                    f"retour ajustement={fitted}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_video_codec(w) -> tuple[bool, str]:
+    """Le fichier téléchargé doit avoir un codec que Qt sait décoder.
+
+    Ce test comble le trou qui a laissé passer l'écran noir : les tests
+    précédents vérifiaient que la vidéo *se télécharge*, jamais qu'elle
+    *se décode*. Une vidéo AV1 se télécharge parfaitement et n'affiche rien.
+    """
+    import tempfile
+    url = os.environ.get("WORKPLAY_TEST_URL")
+    if not url:
+        return (False, "aucune URL de test fournie")
+    tmp = Path(tempfile.mkdtemp(prefix="wp-codec-"))
+    original = w.video_dir
+    try:
+        w.set_video_dir(tmp)
+        dlg = w.vdlg
+        dlg.input.setPlainText(url)
+        dlg.quality.setCurrentIndex(4)          # 360p : le plus rapide
+        dlg.start()
+        if not dlg.proc.waitForFinished(180_000):
+            dlg.proc.kill()
+            return (False, "délai dépassé")
+        for _ in range(20):
+            QApplication.processEvents()
+            if dlg.produced is not None:
+                break
+        if dlg.produced is None:
+            return (False, "aucun fichier produit")
+        codec = probe_video_codec(dlg.produced)
+        ok = codec is not None and codec.lower() in PLAYABLE_VIDEO_CODECS
+        return (ok, f"codec vidéo = {codec} "
+                    f"({'décodable' if ok else 'NON décodable par Qt'})")
+    finally:
+        w.set_video_dir(original)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _test_video_download(w) -> tuple[bool, str]:
     """Télécharge une vraie vidéo en passant par le dialogue de l'interface.
 
@@ -2563,21 +2844,15 @@ def _self_test(app: QApplication, w: "Player", url: str | None = None) -> int:
             w.btn_list.setChecked(True) or w.list.isVisible(),
             f"h={w.height()}px")),
         # --- nouveautés -----------------------------------------------------
-        ("always on top actif", lambda: (
-            bool(w.windowFlags() & Qt.WindowStaysOnTopHint), "drapeau posé")),
-        ("aucune ré-assertion périodique", lambda: (
-            not hasattr(w, "top_timer"),
-            "WorkPlay ne se remet jamais devant tout seul")),
-        ("affichage sans activation", lambda: (
-            w.testAttribute(Qt.WA_ShowWithoutActivating),
-            "WA_ShowWithoutActivating posé")),
-        ("le widget ne prend pas le focus", lambda: _test_no_focus(w)),
+        ("always on top désactivé par défaut", lambda: (
+            not w.always_on_top, f"valeur={w.always_on_top}")),
+        ("always on top activable via le menu", lambda: (
+            (w.set_always_on_top(True),
+             bool(w.windowFlags() & Qt.WindowStaysOnTopHint))[1], "drapeau posé")),
         ("always on top désactivable", lambda: (
             (w.set_always_on_top(False),
              not (w.windowFlags() & Qt.WindowStaysOnTopHint))[1], "drapeau retiré")),
-        ("always on top réactivable", lambda: (
-            (w.set_always_on_top(True),
-             bool(w.windowFlags() & Qt.WindowStaysOnTopHint))[1], "drapeau reposé")),
+        ("vidéo : zoom sans rognage", lambda: _test_video_zoom(w)),
         ("tray icon présent", lambda: (
             w.tray is not None and w.tray.isVisible(), "icône affichée")),
         ("menu tray complet", lambda: (
@@ -2605,6 +2880,7 @@ def _self_test(app: QApplication, w: "Player", url: str | None = None) -> int:
         ("vidéo : fenêtre de lecture", lambda: _test_video_window(w)),
         ("vidéo : plein écran accessible", lambda: _test_video_fullscreen(w)),
         ("vidéo : dossier absent créé à la volée", lambda: _test_video_dir_creation(w)),
+        ("vidéo : codec décodable par Qt", lambda: _test_video_codec(w)),
         ("vidéo : téléchargement réel via le dialogue", lambda: _test_video_download(w)),
         ("yt-dlp localisé", lambda: (find_ytdlp() is not None, str(find_ytdlp()))),
         ("dialogue URLs construit", lambda: (
