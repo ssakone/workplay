@@ -1,0 +1,9 @@
+# Dépendances nécessaires uniquement pour construire l'application.
+# (Elles ne sont pas requises pour faire tourner WorkPlay depuis les sources.)
+-r requirements.txt
+
+# Fabrication du .icns à partir d'une image source
+pillow==12.3.0
+
+# Génération du bundle .app autonome
+pyinstaller==6.22.3

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      PyInstaller embarque des bibliothèques (Qt, Python.framework, FFmpeg)
+      qui chargent des .dylib depuis Resources/. La validation de bibliothèque
+      du runtime renforcé refuse ce chargement, même quand tout est signé par
+      la même identité. Ces deux exceptions sont la pratique standard pour un
+      bundle Python/Qt signé.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <!-- Pas de sandbox : le lecteur doit lire ~/Desktop et lancer yt-dlp. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>

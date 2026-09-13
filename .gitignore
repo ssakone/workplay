@@ -1,0 +1,18 @@
+# Environnement virtuel
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Artefacts de build
+build/
+dist/
+*.iconset/
+
+# macOS
+.DS_Store
+._*
+
+# Éditeurs
+.vscode/
+.idea/
