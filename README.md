@@ -37,11 +37,11 @@ une fois, puis c'est vous qui décidez.
   l'afficher ne retire jamais la frappe de l'application au premier plan. Une
   fenêtre qui s'impose au milieu d'une saisie peut faire des dégâts, donc
   WorkPlay ne le fait pas.
-- **Toujours au premier plan, mais passif** — activable/désactivable à chaud
-  (bouton 📌, menu, `⌘⇧T`). WorkPlay ne se remet **jamais** devant tout seul :
-  aucun mécanisme de ré-assertion périodique. Si une application plein écran
-  passe devant, un clic sur **Ramener au premier plan** dans la barre de menus
-  suffit — et ce geste est le vôtre.
+- **Toujours au premier plan, mais passif et optionnel** — désactivé par
+defaut. L'option existe dans le menu de la barre. WorkPlay ne se remet
+**jamais** devant tout seul : aucun mécanisme de ré-assertion périodique. Si
+une application plein écran passe devant, un clic sur **Ramener au premier
+plan** dans la barre de menus suffit — et ce geste est le vôtre.
 - **Icône dans la barre de menus** — afficher/masquer le widget, lancer la
   lecture, ramener au premier plan, ajouter un lien, choisir les dossiers,
   rescanner la playlist, quitter.
@@ -71,9 +71,10 @@ une fois, puis c'est vous qui décidez.
   titre, rechargement à chaud quand des fichiers apparaissent dans le dossier.
 - **Aucune connexion réseau** en dehors des téléchargements que vous demandez
   explicitement. Pas de télémétrie, pas de compte, pas de publicité.
-- **Auto-test intégré** — 45 vérifications instrumentées des contrôles, du
+- **Auto-test intégré** — 46 vérifications instrumentées des contrôles, du
   tray, de l'absence de vol de focus, des playlists, des modes de répétition,
-  des réglages, de la fenêtre vidéo et du téléchargement réel.
+  des réglages, de la fenêtre vidéo, du codec produit et du téléchargement
+  réel.
 
 ## Installation
 
@@ -167,12 +168,10 @@ Aucun identifiant Apple n'est stocké dans le dépôt : tout passe par
 | **↑** / **↓** | Volume ± 5 % |
 | **L** | Afficher / masquer la playlist |
 | **R** | Changer de mode de répétition |
-| **⌘⇧T** | Activer / désactiver le premier plan |
 | **Échap** | Replier la playlist, puis masquer le widget |
 | Double-clic sur le widget | Lecture / Pause |
 | Double-clic dans la liste | Jouer ce morceau |
 | Clic sur la barre | Se déplacer dans le morceau |
-| 📌 | Épingler / détacher du premier plan |
 | ✕ | Quitter |
 | Clic sur l'icône du menu | Afficher / masquer le widget |
 
@@ -253,7 +252,8 @@ Dès que le téléchargement est terminé, la fenêtre vidéo s'ouvre.
 | Geste | Effet |
 |---|---|
 | **F** ou double-clic | Plein écran aller/retour |
-| **A** | Taille d'origine / remplissage de la fenêtre |
+| Molette, **+** / **−** | Agrandir / réduire l'image (1× à 6×) |
+| **A** | Revenir à l'image entière (ajustement) |
 | **Espace** | Lecture / Pause |
 | **←** / **→** | Reculer / avancer de 5 s |
 | **Échap** | Quitter le plein écran, puis fermer |
@@ -280,9 +280,9 @@ WORKPLAY_SELFTEST=1 WORKPLAY_TEST_URL="https://www.youtube.com/watch?v=..." \
 ```
 
 Le rapport couvre la playlist, la lecture, les contrôles de transport, le
-volume, la barre de progression, l'épinglage au premier plan, l'absence de vol
-de focus, le tray, le changement de dossier et un téléchargement réel dans un
-dossier temporaire.
+volume, la barre de progression, le premier plan, l'absence de vol de focus, le
+tray, le changement de dossier, le codec vidéo produit (décodable par Qt), le
+zoom sans rognage, et deux téléchargements réels dans des dossiers temporaires.
 
 ## Architecture
 
