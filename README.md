@@ -45,6 +45,20 @@ une fois, puis c'est vous qui décidez.
 - **Icône dans la barre de menus** — afficher/masquer le widget, lancer la
   lecture, ramener au premier plan, ajouter un lien, choisir les dossiers,
   rescanner la playlist, quitter.
+- **Playlists nommées** — créez, jouez et gérez des listes. Une playlist ne
+  contient que des noms de fichiers : le morceau reste unique dans la
+  bibliothèque, et déplacer un fichier rend l'entrée introuvable sans rien
+  casser.
+- **Répétition** — trois modes : **désactivée** (on s'arrête en fin de liste),
+  **morceau** (le titre en cours rejoue en boucle) et **liste** (retour au
+  premier morceau). Cycle avec `R`, le bouton ↻ ou le menu. Le mode est
+  mémorisé entre deux lancements.
+- **Téléchargement vidéo avec choix de la qualité** — collez un lien, choisissez
+  la résolution (meilleure, 1080p, 720p, 480p, 360p) ou demandez les qualités
+  réellement disponibles sur la source. Le fichier est fusionné en MP4.
+- **Fenêtre vidéo** — lecture dans une fenêtre dédiée, avec **plein écran**
+  (`F` ou double-clic), **ajustement** à la fenêtre (`A`), saut de 5 s avec les
+  flèches, et barre de contrôle qui s'efface en plein écran.
 - **Réglages** — un panneau dédié pour choisir le dossier de la
   bibliothèque et, séparément, le dossier où atterrissent les téléchargements.
   Si les deux diffèrent, les morceaux récupérés rejoignent automatiquement la
@@ -57,9 +71,9 @@ une fois, puis c'est vous qui décidez.
   titre, rechargement à chaud quand des fichiers apparaissent dans le dossier.
 - **Aucune connexion réseau** en dehors des téléchargements que vous demandez
   explicitement. Pas de télémétrie, pas de compte, pas de publicité.
-- **Auto-test intégré** — 31 vérifications instrumentées des contrôles, du
-  tray, de l'absence de vol de focus, des réglages, du changement de dossier et
-  du téléchargement réel.
+- **Auto-test intégré** — 45 vérifications instrumentées des contrôles, du
+  tray, de l'absence de vol de focus, des playlists, des modes de répétition,
+  des réglages, de la fenêtre vidéo et du téléchargement réel.
 
 ## Installation
 
@@ -139,6 +153,10 @@ Aucun identifiant Apple n'est stocké dans le dépôt : tout passe par
 
 ![Panneau de réglages](assets/settings.png)
 
+### Télécharger une vidéo
+
+![Téléchargement vidéo](assets/video.png)
+
 ## Utilisation
 
 | Geste | Effet |
@@ -148,6 +166,7 @@ Aucun identifiant Apple n'est stocké dans le dépôt : tout passe par
 | **←** / **→** | Piste précédente / suivante |
 | **↑** / **↓** | Volume ± 5 % |
 | **L** | Afficher / masquer la playlist |
+| **R** | Changer de mode de répétition |
 | **⌘⇧T** | Activer / désactiver le premier plan |
 | **Échap** | Replier la playlist, puis masquer le widget |
 | Double-clic sur le widget | Lecture / Pause |
@@ -191,6 +210,57 @@ WORKPLAY_DIR=~/Musique/MaCollection ./.venv/bin/python app.py
 
 Extensions reconnues : `mp3`, `m4a`, `aac`, `wav`, `flac`, `ogg`, `opus`, `webm`.
 
+### Playlists
+
+Barre de menus → **Nouvelle playlist…** pour en créer une vide, ou
+**Enregistrer la liste affichée…** pour figer la liste en cours.
+
+Le sous-menu **Jouer une playlist** liste vos playlists et permet de revenir à
+**Toute la bibliothèque**. Le morceau en cours peut être ajouté à une playlist
+existante, ou retiré d'une playlist.
+
+Les playlists vivent dans
+`~/Library/Application Support/WorkPlay/playlists/`, en JSON lisible :
+
+```json
+{
+  "name": "Mes hits",
+  "tracks": ["NAMADINGO - AMBU.mp3", "Namadingo - Na.mp3"]
+}
+```
+
+### Répétition
+
+Trois modes, cyclés par le bouton ↻ du widget, la touche `R` ou le menu :
+
+| Mode | Comportement en fin de morceau |
+|---|---|
+| **↻ désactivée** | On s'arrête en fin de liste |
+| **↻1 morceau** | Le titre en cours rejoue indéfiniment |
+| **↻∞ liste** | Retour au premier morceau (boucle) |
+
+Un geste manuel (bouton suivant, flèche `→`) reste toujours possible : seul le
+comportement en fin de liste change.
+
+### Regarder une vidéo
+
+Barre de menus → **Télécharger une vidéo…** : collez un lien, choisissez la
+qualité, puis **Télécharger**. Le bouton **Voir les qualités réelles**
+interroge la source et affiche les résolutions disponibles avant de choisir.
+
+Dès que le téléchargement est terminé, la fenêtre vidéo s'ouvre.
+
+| Geste | Effet |
+|---|---|
+| **F** ou double-clic | Plein écran aller/retour |
+| **A** | Taille d'origine / remplissage de la fenêtre |
+| **Espace** | Lecture / Pause |
+| **←** / **→** | Reculer / avancer de 5 s |
+| **Échap** | Quitter le plein écran, puis fermer |
+
+Barre de menus → **Ouvrir une vidéo…** pour revoir un fichier déjà téléchargé
+(dossier par défaut `~/Movies/WorkPlay`).
+
 ## Configuration
 | Variable d'environnement | Effet |
 |---|---|
@@ -227,6 +297,7 @@ workplay/
 │   ├── logo.png            logo (README)
 │   ├── screenshot.png      capture du widget
 │   ├── settings.png        capture du panneau de réglages
+│   ├── video.png           capture du téléchargement vidéo
 │   └── entitlements.plist  entitlements de signature macOS
 └── tools/
     ├── build.sh            build + signature du .app

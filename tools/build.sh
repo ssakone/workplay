@@ -16,7 +16,15 @@ IDENTITY="${1:--}"
 APP="dist/WorkPlay.app"
 
 echo "==> Nettoyage"
-rm -rf build dist
+# Finder peut recréer un .DS_Store pendant la suppression : on réessaie.
+for _ in 1 2 3; do
+    rm -rf build dist 2>/dev/null || true
+    [ ! -d build ] && [ ! -d dist ] && break
+    sleep 1
+done
+[ -d build ] || [ -d dist ] && find build dist -name ".DS_Store" -delete 2>/dev/null || true
+rm -rf build dist 2>/dev/null || true
+mkdir -p dist
 
 echo "==> Build PyInstaller"
 ./.venv/bin/pyinstaller workplay.spec --noconfirm --clean
