@@ -189,7 +189,7 @@ workplay/
 ├── requirements-dev.txt    dépendances de construction
 ├── assets/
 │   ├── AppIcon.icns        icône du bundle
-│   ├── logoc.png            logo (README)
+│   ├── logo.png            logo (README)
 │   ├── screenshot.png      capture du widget
 │   ├── settings.png        capture du panneau de réglages
 │   └── entitlements.plist  entitlements de signature macOS
@@ -235,3 +235,21 @@ que WorkPlay s'interdit.
 ## Licence
 
 [MIT](LICENSE).
+
+---
+
+<div align="center">
+
+### Le logo
+
+<img src="assets/logo.png" width="220" alt="Logo WorkPlay">
+
+### L'interface
+
+<img src="assets/screenshot.png" width="420" alt="Widget WorkPlay, playlist ouverte">
+
+### Les réglages
+
+<img src="assets/settings.png" width="620" alt="Panneau de réglages WorkPlay">
+
+</div>
