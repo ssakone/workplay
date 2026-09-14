@@ -3705,16 +3705,22 @@ def _test_play_index_routes_video(w) -> tuple[bool, str]:
         original_play_video = w.play_video
         w.play_video = lambda p: calls.append(p)  # type: ignore[assignment]
         try:
+            # play_video étant neutralisé, play_index ne touche plus à la
+            # source : on la vide avant pour que le test ne mesure pas les
+            # restes du test précédent (d'où son comportement erratique).
+            w.player.stop()
+            w.player.setSource(QUrl())
             w.play_index(w.tracks.index(clip))
         finally:
             w.play_video = original_play_video  # type: ignore[assignment]
 
-        # Et le lecteur ne doit PAS être chargé directement avec la vidéo.
+        # Et le lecteur ne doit PAS être chargé directement avec la vidéo :
+        # la source reste vide, puisque c'est play_video qui s'en occupe.
         src = w.player.source().toLocalFile()
         routed = calls == [clip]
-        not_raw = src == "" or not src.endswith(".mp4")
+        not_raw = src == ""
         ok = routed and not_raw
-        return (ok, f"routé={routed} source_brute='{src}'")
+        return (ok, f"routé={routed} source_brute={'vide' if not_raw else src}")
     finally:
         w.player.stop()
         w.player.setSource(QUrl())
