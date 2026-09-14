@@ -396,11 +396,32 @@ def natural_key(name: str):
 
 
 def scan_tracks(directory: Path) -> list[Path]:
+    """Liste les fichiers audio d'un dossier, dans l'ordre d'affichage."""
     if not directory.is_dir():
         return []
     files = [p for p in directory.iterdir()
              if p.suffix.lower() in AUDIO_EXTS and not p.name.startswith(".")]
     return sorted(files, key=lambda p: natural_key(p.name))
+
+
+def scan_media(directories: list[Path]) -> list[Path]:
+    """Liste audio + vidéo de plusieurs dossiers, dédoublonnés par chemin.
+
+    Un fichier vidéo dans un dossier audio (ou l'inverse) est classé selon
+    l'extension : la liste est fidèle au contenu, pas à la case du dossier.
+    """
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for p in directory.iterdir():
+            if p.name.startswith(".") or p in seen:
+                continue
+            if p.suffix.lower() in AUDIO_EXTS | VIDEO_EXTS:
+                seen.add(p)
+                out.append(p)
+    return sorted(out, key=lambda p: natural_key(p.name))
 
 
 def find_ytdlp() -> str | None:
@@ -499,9 +520,20 @@ class PlaylistStore:
         return True
 
 
-def resolve_playlist(names: list[str], music_dir: Path) -> list[Path]:
-    """Noms de fichiers -> chemins existants, dans l'ordre de la playlist."""
-    return [music_dir / n for n in names if (music_dir / n).is_file()]
+def resolve_playlist(names: list[str], music_dirs: list[Path]) -> list[Path]:
+    """Noms de fichiers -> chemins existants, dans l'ordre de la playlist.
+
+    Plusieurs dossiers : un nom est cherché dans chacun, dans l'ordre où ils
+    sont déclarés. Le premier dossier qui contient le fichier gagne.
+    """
+    out: list[Path] = []
+    for name in names:
+        for d in music_dirs:
+            cand = d / name
+            if cand.is_file():
+                out.append(cand)
+                break
+    return out
 
 
 def process_env() -> QProcessEnvironment:
@@ -735,23 +767,101 @@ class DownloadDialog(QDialog):
 # Dialogue « Réglages »
 # --------------------------------------------------------------------------- #
 
-class SettingsDialog(QDialog):
-    """Réglages : dossier de la bibliothèque et dossier de téléchargement.
+class _FolderList(QWidget):
+    """Liste de dossiers avec ajout / suppression, pour le dialogue réglages.
 
-    Les chemins se choisissent par le sélecteur macOS plutôt qu'en les tapant :
-    c'est plus sûr et cela évite les chemins invalides.
+    Chaque dossier ajouté est scanné par la bibliothèque ; l'utilisateur en
+    ajoute autant qu'il veut, et les retire d'un clic sur « − ».
+    """
+
+    changed = Signal()
+
+    def __init__(self, paths: list[Path], parent=None):
+        super().__init__(parent)
+        self.paths = [Path(p) for p in paths]
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        self.list = QListWidget()
+        self.list.setFixedHeight(96)
+        self.list.setStyleSheet(
+            "QListWidget{background:rgba(255,255,255,10);"
+            "border:1px solid rgba(255,255,255,30);border-radius:8px;}"
+            "QListWidget::item{padding:4px 8px;}"
+        )
+        lay.addWidget(self.list)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        btn_add = QPushButton("＋ Ajouter un dossier…")
+        btn_add.setObjectName("Ghost")
+        btn_add.setFixedHeight(26)
+        btn_add.clicked.connect(self._add)
+        row.addWidget(btn_add)
+
+        self.btn_del = QPushButton("− Retirer")
+        self.btn_del.setObjectName("Ghost")
+        self.btn_del.setFixedHeight(26)
+        self.btn_del.clicked.connect(self._remove)
+        row.addWidget(self.btn_del)
+        row.addStretch(1)
+        lay.addLayout(row)
+        # Le premier refill a besoin du bouton pour l'activer/désactiver.
+        self._refill()
+
+    def _refill(self) -> None:
+        self.list.clear()
+        for p in self.paths:
+            QListWidgetItem(str(p), self.list)
+        self.btn_del.setEnabled(bool(self.paths))
+
+    def _add(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Ajouter un dossier", str(self.paths[-1] if self.paths
+                                             else Path.home())
+        )
+        if chosen:
+            path = Path(chosen)
+            if path not in self.paths:
+                self.paths.append(path)
+                self._refill()
+                self.changed.emit()
+
+    def _remove(self) -> None:
+        row = self.list.currentRow()
+        if 0 <= row < len(self.paths):
+            del self.paths[row]
+            self._refill()
+            self.changed.emit()
+
+
+class SettingsDialog(QDialog):
+    """Réglages : dossiers de la bibliothèque, dossier vidéo, fenêtre vidéo.
+
+    Les dossiers se choisissent par le sélecteur macOS plutôt qu'en les tapant :
+    c'est plus sûr et cela évite les chemins invalides. On peut en ajouter
+    autant qu'on veut — la bibliothèque lit tout ce qui est déclaré.
     """
 
     applied = Signal()
 
-    def __init__(self, music_dir: Path, download_dir: Path, parent=None):
+    def __init__(self, music_dirs: list[Path], video_dirs: list[Path],
+                 video_separate_window: bool,
+                 download_dir: Path, parent=None):
         super().__init__(parent)
-        self.music_dir = Path(music_dir)
+        self.music_dirs = [Path(d) for d in music_dirs]
+        self.video_dirs = [Path(d) for d in video_dirs]
+        self.video_separate_window = bool(video_separate_window)
         self.download_dir = Path(download_dir)
-        self.same_as_library = self.download_dir == self.music_dir
+        # Le téléchargement atterrit dans le premier dossier audio s'il existe.
+        self.same_as_library = (
+            self.download_dir == self.music_dirs[0] if self.music_dirs else True
+        )
 
         self.setWindowTitle("Réglages WorkPlay")
-        self.setMinimumWidth(580)
+        self.setMinimumWidth(600)
         self.setStyleSheet(STYLE)
         # Le dialogue reste au-dessus : c'est une action volontaire de
         # l'utilisateur, contrairement au widget qui ne s'impose jamais.
@@ -765,15 +875,33 @@ class SettingsDialog(QDialog):
         title.setObjectName("DlgTitle")
         root.addWidget(title)
 
-        # --- Dossier de la bibliothèque -------------------------------------
-        root.addWidget(self._section("Bibliothèque",
-                                     "Où WorkPlay cherche vos fichiers audio."))
-        self.lbl_lib = self._path_label(self.music_dir)
-        root.addWidget(self.lbl_lib)
-        root.addLayout(self._buttons(
-            ("Choisir un dossier…", self._choose_library),
-            ("Ouvrir", lambda: os.system(f'open "{self.music_dir}"')),
+        # --- Dossiers audio --------------------------------------------------
+        root.addWidget(self._section(
+            "Bibliothèque audio",
+            "Dossiers où WorkPlay cherche vos fichiers audio. "
+            "Ajoutez-en autant que vous voulez.",
         ))
+        self.folders_music = _FolderList(self.music_dirs, self)
+        self.folders_music.changed.connect(self._sync_enabled)
+        root.addWidget(self.folders_music)
+
+        # --- Dossiers vidéo --------------------------------------------------
+        root.addWidget(self._section(
+            "Bibliothèque vidéo",
+            "Dossiers où WorkPlay cherche vos fichiers vidéo.",
+        ))
+        self.folders_video = _FolderList(self.video_dirs, self)
+        root.addWidget(self.folders_video)
+
+        # --- Fenêtre vidéo séparée -------------------------------------------
+        self.chk_separate = QCheckBox(
+            "Ouvrir la vidéo dans une fenêtre séparée"
+        )
+        self.chk_separate.setChecked(self.video_separate_window)
+        self.chk_separate.setToolTip(
+            "Si décoché, la vidéo joue dans le widget compact (son seul)."
+        )
+        root.addWidget(self.chk_separate)
 
         # --- Dossier de téléchargement --------------------------------------
         root.addWidget(self._section(
@@ -781,7 +909,7 @@ class SettingsDialog(QDialog):
             "Où arrivent les morceaux récupérés depuis une URL.",
         ))
         self.chk_same = QCheckBox(
-            "Télécharger dans le dossier de la bibliothèque"
+            "Télécharger dans le premier dossier audio"
         )
         self.chk_same.setChecked(self.same_as_library)
         self.chk_same.stateChanged.connect(self._on_same_toggled)
@@ -848,17 +976,6 @@ class SettingsDialog(QDialog):
         return row
 
     # --------------------------------------------------------------- choix --
-    def _choose_library(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(
-            self, "Choisir le dossier de la bibliothèque", str(self.music_dir)
-        )
-        if chosen:
-            self.music_dir = Path(chosen)
-            self.lbl_lib.setText(str(self.music_dir))
-            if self.chk_same.isChecked():
-                self.download_dir = self.music_dir
-                self.lbl_dl.setText(str(self.download_dir))
-
     def _choose_download(self) -> None:
         chosen = QFileDialog.getExistingDirectory(
             self, "Choisir le dossier de téléchargement", str(self.download_dir)
@@ -869,8 +986,8 @@ class SettingsDialog(QDialog):
 
     def _on_same_toggled(self) -> None:
         self.same_as_library = self.chk_same.isChecked()
-        if self.same_as_library:
-            self.download_dir = self.music_dir
+        if self.same_as_library and self.music_dirs:
+            self.download_dir = self.music_dirs[0]
             self.lbl_dl.setText(str(self.download_dir))
         self._sync_enabled()
 
@@ -881,8 +998,16 @@ class SettingsDialog(QDialog):
             if w is not None:
                 w.setEnabled(not self.same_as_library)
         self.lbl_dl.setEnabled(not self.same_as_library)
+        # La case « même dossier » n'a de sens que s'il y a au moins un dossier
+        # audio ; sans lui, on ne sait pas où livrer.
+        self.chk_same.setEnabled(bool(self.folders_music.paths))
 
     def _accept(self) -> None:
+        # On recopie les listes mutées par _FolderList dans les attributs
+        # publics du dialogue — c'est ce que Player relit ensuite.
+        self.music_dirs = list(self.folders_music.paths)
+        self.video_dirs = list(self.folders_video.paths)
+        self.video_separate_window = self.chk_separate.isChecked()
         self.applied.emit()
         self.accept()
 
@@ -1953,13 +2078,21 @@ class Player(QWidget):
     COMPACT_H = CONTENT_H + 2 * SHADOW_PAD
     ITEM_H = 27
 
-    def __init__(self, music_dir: Path, download_dir: Path | None = None):
+    def __init__(self, music_dirs: list[Path], download_dir: Path | None = None):
         super().__init__()
-        self.music_dir = music_dir
-        # Dossier d'atterrissage des téléchargements : par défaut le même que
-        # la bibliothèque, pour que le morceau apparaisse aussitôt dans la liste.
-        self.download_dir = download_dir or music_dir
-        self.tracks: list[Path] = scan_tracks(music_dir)
+        self.music_dirs = [Path(d) for d in music_dirs]
+        # Les dossiers vidéo sont initialisés avant le scan : la bibliothèque
+        # unifiée lit tout ce qui est déclaré, audio et vidéo confondus.
+        self.video_dirs: list[Path] = [VIDEO_DIR_DEFAULT]
+        # La vidéo s'ouvre dans une fenêtre séparée par défaut — la plus
+        # intuitive pour un widget compact qui ne montre pas l'image.
+        self.video_separate_window: bool = True
+        # Dossier d'atterrissage des téléchargements : par défaut le premier
+        # dossier audio, pour que le morceau apparaisse aussitôt dans la liste.
+        self.download_dir = download_dir or (
+            self.music_dirs[0] if self.music_dirs else Path.home()
+        )
+        self.tracks: list[Path] = scan_media(self.music_dirs + self.video_dirs)
         self.index = -1
         self._drag_offset: QPoint | None = None
         self._seeking = False
@@ -1973,7 +2106,6 @@ class Player(QWidget):
         self.playlists = PlaylistStore()
         self.current_playlist: str | None = None
         self.video_win: VideoWindow | None = None
-        self.video_dir = VIDEO_DIR_DEFAULT
 
         # ---- Fenêtre : sans cadre, translucide, au premier plan -------------
         self.setWindowFlags(self._flags(self.always_on_top))
@@ -2229,12 +2361,12 @@ class Player(QWidget):
 
         self.act_paste = menu.addAction("Ajouter le lien du presse-papiers")
         self.act_paste.triggered.connect(self.add_clipboard_url)
-        self.act_folder = menu.addAction("Ouvrir le dossier musique")
+        self.act_folder = menu.addAction("Ouvrir le premier dossier musique")
         self.act_folder.triggered.connect(
-            lambda: os.system(f'open "{self.music_dir}"')
+            lambda: os.system(f'open "{self.music_dirs[0]}"') if self.music_dirs else None
         )
 
-        self.act_choose = menu.addAction("Choisir le dossier musique…")
+        self.act_choose = menu.addAction("Ajouter un dossier musique…")
         self.act_choose.triggered.connect(self.choose_music_dir)
 
         self.act_settings = menu.addAction("Réglages…")
@@ -2276,9 +2408,9 @@ class Player(QWidget):
         self.act_open_video = menu.addAction("Ouvrir une vidéo…")
         self.act_open_video.triggered.connect(self.open_video_picker)
 
-        self.act_video_folder = menu.addAction("Ouvrir le dossier vidéo")
+        self.act_video_folder = menu.addAction("Ouvrir le premier dossier vidéo")
         self.act_video_folder.triggered.connect(
-            lambda: os.system(f'open "{self.video_dir}"')
+            lambda: os.system(f'open "{self.video_dirs[0]}"') if self.video_dirs else None
         )
 
         self.act_rescan = menu.addAction("Rescanner la playlist")
@@ -2324,9 +2456,13 @@ class Player(QWidget):
 
     # ---------------------------------------------------------- downloads --
     def _build_download_dialog(self) -> None:
-        self.dlg = DownloadDialog(self.music_dir, self.download_dir, parent=None)
+        self.dlg = DownloadDialog(
+            self.music_dirs[0] if self.music_dirs else self.download_dir,
+            self.download_dir, parent=None)
         self.dlg.finished_all.connect(self._after_downloads)
-        self.vdlg = VideoDownloadDialog(self.video_dir, parent=None)
+        self.vdlg = VideoDownloadDialog(
+            self.video_dirs[0] if self.video_dirs else self.download_dir,
+            parent=None)
         self.vdlg.finished_ok.connect(self._on_video_downloaded)
         self.udlg = UpdateDialog(parent=None)
 
@@ -2383,25 +2519,20 @@ class Player(QWidget):
         self.open_download_dialog()
         self.dlg.add_url(text)
 
-    # --------------------------------------------------------- dossier -----
+    # --------------------------------------------------------- dossiers ----
     def choose_music_dir(self) -> None:
-        """Laisse choisir un autre dossier musical et l'adopte immédiatement."""
+        """Ajoute un dossier musical à la bibliothèque."""
         chosen = QFileDialog.getExistingDirectory(
-            None, "Choisir le dossier musique", str(self.music_dir)
+            None, "Choisir un dossier musique", str(self.music_dirs[0])
         )
         if chosen:
-            self.change_music_dir(Path(chosen))
+            self.change_music_dirs(self.music_dirs + [Path(chosen)])
 
-    def change_music_dir(self, new_dir: Path) -> None:
-        """Bascule vers un autre dossier, mémorise le choix, relance la lecture."""
-        if new_dir == self.music_dir:
+    def change_music_dirs(self, dirs: list[Path]) -> None:
+        """Remplace la liste audio, mémorise le choix, relance la lecture."""
+        if dirs == self.music_dirs:
             return
-        self.music_dir = new_dir
-        self.settings.setValue("music_dir", str(new_dir))
-        self._persist()
-        # Le dialogue de téléchargement doit écrire dans le nouveau dossier.
-        self.dlg.music_dir = new_dir
-        self.dlg.proc.setWorkingDirectory(str(new_dir))
+        self.set_music_dirs(dirs)
         self.index = -1
         self.refresh_tracks(force=True)
         if self.tracks:
@@ -2411,10 +2542,31 @@ class Player(QWidget):
             self.lbl_title.setText("Aucun fichier audio")
         self.lbl_artist.setText(self._count_label())
 
+    def set_music_dirs(self, dirs: list[Path]) -> None:
+        """Mémorise la liste des dossiers audio et recharge la bibliothèque."""
+        self.music_dirs = [Path(d) for d in dirs]
+        self.settings.setValue("music_dirs", json.dumps(
+            [str(d) for d in self.music_dirs]))
+        self._persist()
+        # Le dialogue de téléchargement écrit dans le premier dossier audio.
+        if self.music_dirs:
+            self.dlg.music_dir = self.music_dirs[0]
+            self.dlg.proc.setWorkingDirectory(str(self.music_dirs[0]))
+
+    def set_video_separate_window(self, enabled: bool) -> None:
+        """Ouvre la vidéo dans une fenêtre séparée (True) ou dans le widget."""
+        self.video_separate_window = bool(enabled)
+        self.settings.setValue("video_separate_window",
+                               "1" if enabled else "0")
+        self._persist()
+        # Si on coupe la fenêtre pendant la lecture, on la referme proprement.
+        if not enabled and self.video_win is not None:
+            self.video_win.hide()
+
     def _after_downloads(self) -> None:
         """Après un lot : rapatrie les fichiers si les dossiers diffèrent,
         puis met la playlist à jour."""
-        if self.download_dir != self.music_dir:
+        if self.music_dirs and self.download_dir != self.music_dirs[0]:
             moved = self._collect_downloads()
             if moved:
                 self.dlg._log(f"{moved} fichier(s) déplacé(s) vers la bibliothèque.")
@@ -2434,7 +2586,7 @@ class Player(QWidget):
                 continue
             if src.suffix.lower() not in AUDIO_EXTS:
                 continue
-            dest = self.music_dir / src.name
+            dest = self.music_dirs[0] / src.name
             try:
                 if dest.exists():
                     self.dlg._log(f"déjà présent, ignoré : {src.name}")
@@ -2452,29 +2604,43 @@ class Player(QWidget):
         self.dlg.download_dir = path
         self.dlg.proc.setWorkingDirectory(str(path))
 
-    def set_video_dir(self, path: Path) -> None:
-        """Change le dossier vidéo et s'assure qu'il existe."""
-        path = Path(path)
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        self.video_dir = path
-        self.settings.setValue("video_dir", str(path))
+    def set_video_dirs(self, dirs: list[Path]) -> None:
+        """Change les dossiers vidéo et s'assure que le premier existe."""
+        if dirs:
+            try:
+                dirs[0].mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+        self.video_dirs = [Path(d) for d in dirs]
+        self.settings.setValue("video_dirs", json.dumps(
+            [str(d) for d in self.video_dirs]))
         self._persist()
-        self.vdlg.video_dir = path
-        self.vdlg.proc.setWorkingDirectory(str(path))
+        if self.video_dirs:
+            self.vdlg.video_dir = self.video_dirs[0]
+            self.vdlg.proc.setWorkingDirectory(str(self.video_dirs[0]))
 
     def open_settings_dialog(self) -> None:
-        dlg = SettingsDialog(self.music_dir, self.download_dir, parent=None)
+        dlg = SettingsDialog(
+            self.music_dirs,
+            self.video_dirs,
+            self.video_separate_window,
+            self.download_dir,
+            parent=None,
+        )
         dlg.applied.connect(lambda: self._apply_settings(dlg))
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()   # action volontaire : l'utilisateur veut ce dialogue
 
     def _apply_settings(self, dlg: "SettingsDialog") -> None:
+        # Les listes sont déjà recopiées par le dialogue avant l'émission.
+        self.set_music_dirs(dlg.music_dirs)
+        self.set_video_dirs(dlg.video_dirs)
+        self.set_video_separate_window(dlg.video_separate_window)
         self.set_download_dir(Path(dlg.download_dir))
-        self.change_music_dir(Path(dlg.music_dir))
+        self.index = -1
+        self.refresh_tracks(force=True)
+        self.lbl_artist.setText(self._count_label())
     # ---------------------------------------------------------- répétition --
     def set_repeat(self, mode: str) -> None:
         if mode not in REPEAT_ORDER:
@@ -2513,9 +2679,9 @@ class Player(QWidget):
         )
 
     def load_library(self) -> None:
-        """Revient à la bibliothèque complète."""
+        """Revient à la bibliothèque complète (audio + vidéo, tous dossiers)."""
         self.current_playlist = None
-        self.tracks = scan_tracks(self.music_dir)
+        self.tracks = scan_media(self.music_dirs + self.video_dirs)
         self._fill_list()
         self.lbl_artist.setText(self._count_label())
         if self.tracks:
@@ -2526,7 +2692,7 @@ class Player(QWidget):
 
     def load_playlist(self, name: str) -> None:
         """Charge une playlist nommée et démarre sa lecture."""
-        resolved = resolve_playlist(self.playlists.load(name), self.music_dir)
+        resolved = resolve_playlist(self.playlists.load(name), self.music_dirs)
         if not resolved:
             self.dlg._log(f"Playlist « {name} » : aucun fichier trouvé.")
             return
@@ -2604,33 +2770,38 @@ class Player(QWidget):
         self.video_win = None
 
     def list_videos(self) -> list[Path]:
-        if not self.video_dir.is_dir():
-            return []
-        return sorted(
-            p for p in self.video_dir.iterdir()
-            if p.suffix.lower() in VIDEO_EXTS and not p.name.startswith(".")
-        )
+        """Toutes les vidéos connues, tous dossiers confondus."""
+        out: list[Path] = []
+        for d in self.video_dirs:
+            if not d.is_dir():
+                continue
+            out.extend(
+                p for p in d.iterdir()
+                if p.suffix.lower() in VIDEO_EXTS and not p.name.startswith(".")
+            )
+        return sorted(out, key=lambda p: natural_key(p.name))
 
     def play_video(self, path: Path) -> None:
-        """Bascule la lecture sur une vidéo et ouvre la fenêtre d'image.
+        """Bascule la lecture sur une vidéo.
 
-        L'ordre compte : la fenêtre (donc la surface de rendu) doit exister et
-        être affichée AVANT que la source soit chargée, sinon la première image
-        n'est jamais rendue.
+        Si « fenêtre séparée » est activé, la fenêtre d'image est affichée
+        AVANT la source pour que la première frame soit rendue ; sinon la vidéo
+        joue dans le widget (son seul, pas d'image).
         """
         self.lbl_title.setText(path.stem)
         self.lbl_artist.setText(f"vidéo · {path.name}")
-        self.open_video(path)
+        if self.video_separate_window:
+            self.open_video(path)
         self.player.setSource(QUrl.fromLocalFile(str(path)))
         self.player.play()
 
     def open_video_picker(self) -> None:
-        """Choisit une vidéo parmi celles du dossier vidéo."""
+        """Choisit une vidéo parmi celles des dossiers déclarés."""
         videos = self.list_videos()
         if not videos:
             self.dlg._log(
-                f"Aucune vidéo dans {self.video_dir}. "
-                "Utilise « Télécharger une vidéo… »."
+                "Aucune vidéo dans les dossiers configurés. "
+                "Utilise « Télécharger une vidéo… » ou ajoute un dossier."
             )
             return
         labels = [p.stem for p in videos]
@@ -2642,9 +2813,9 @@ class Player(QWidget):
 
     # ------------------------------------------------------------ playlist --
     def refresh_tracks(self, force: bool = False) -> None:
-        """Relit le dossier et met la playlist à jour sans couper la lecture."""
+        """Relit tous les dossiers et met la liste à jour sans couper la lecture."""
         playing = self.tracks[self.index].stem if 0 <= self.index < len(self.tracks) else None
-        new = scan_tracks(self.music_dir)
+        new = scan_media(self.music_dirs + self.video_dirs)
         if new == self.tracks and not force:
             return
 
@@ -2886,17 +3057,18 @@ class Player(QWidget):
 # --------------------------------------------------------------------------- #
 
 def _test_change_dir(w) -> tuple[bool, str]:
-    """Vérifie qu'on peut basculer vers un autre dossier et en revenir."""
+    """Vérifie qu'on peut ajouter un dossier et recharger la liste complète."""
     import tempfile
-    original = w.music_dir
+    original = list(w.music_dirs)
     tmp = Path(tempfile.mkdtemp(prefix="workplay-dir-"))
     try:
-        w.change_music_dir(tmp)
-        switched = w.music_dir == tmp and w.tracks == []
-        w.change_music_dir(original)
-        restored = w.music_dir == original and len(w.tracks) >= 1
-        return (switched and restored,
-                f"bascule={'OK' if switched else 'KO'} "
+        # Un dossier vide ajouté ne casse rien et la liste reste celle d'avant.
+        w.change_music_dirs(original + [tmp])
+        added = tmp in w.music_dirs and len(w.tracks) >= 1
+        w.change_music_dirs(original)
+        restored = w.music_dirs == original and len(w.tracks) >= 1
+        return (added and restored,
+                f"ajout={'OK' if added else 'KO'} "
                 f"retour={'OK' if restored else 'KO'} "
                 f"({len(w.tracks)} pistes)")
     finally:
@@ -2922,33 +3094,51 @@ def _screenshot_mode(app: QApplication, w: "Player", dest: Path) -> int:
 
 
 def _test_settings_dialog(w) -> tuple[bool, str]:
-    """Le dialogue de réglages se construit et propose les deux dossiers."""
-    dlg = SettingsDialog(w.music_dir, w.download_dir)
+    """Le dialogue de réglages se construit et propose les dossiers."""
+    dlg = SettingsDialog(w.music_dirs, w.video_dirs,
+                         w.video_separate_window, w.download_dir)
     ok = (hasattr(dlg, "chk_same") and hasattr(dlg, "btn_dl_row")
-          and str(dlg.music_dir) == str(w.music_dir))
+          and hasattr(dlg, "folders_music") and hasattr(dlg, "folders_video")
+          and dlg.music_dirs == w.music_dirs)
     dlg.deleteLater()
-    return (ok, f"bibliothèque={dlg.music_dir.name}")
+    return (ok, f"audio={len(dlg.music_dirs)} vidéo={len(dlg.video_dirs)}")
 
 
 def _test_settings_apply(w) -> tuple[bool, str]:
-    """Appliquer les réglages change réellement les deux dossiers."""
+    """Appliquer les réglages change réellement les listes de dossiers."""
     import tempfile
-    original_music, original_dl = w.music_dir, w.download_dir
+    original_music = list(w.music_dirs)
+    original_video = list(w.video_dirs)
+    original_dl = w.download_dir
     tmp_lib = Path(tempfile.mkdtemp(prefix="wp-lib-"))
+    tmp_vid = Path(tempfile.mkdtemp(prefix="wp-vid-"))
     tmp_dl = Path(tempfile.mkdtemp(prefix="wp-dl-"))
     try:
-        dlg = SettingsDialog(tmp_lib, tmp_dl)
-        w._apply_settings(dlg)
-        changed = (w.music_dir == tmp_lib and w.download_dir == tmp_dl)
+        dlg = SettingsDialog([tmp_lib], [tmp_vid], False, tmp_dl)
+        dlg.applied.connect(lambda: w._apply_settings(dlg))
+        dlg.folders_music.paths = [tmp_lib]
+        dlg.folders_video.paths = [tmp_vid]
+        dlg.chk_separate.setChecked(False)
+        dlg._accept()
+        changed = (w.music_dirs == [tmp_lib] and w.video_dirs == [tmp_vid]
+                   and w.download_dir == tmp_dl and not w.video_separate_window)
         # Retour à l'état initial.
-        back = SettingsDialog(original_music, original_dl)
-        w._apply_settings(back)
-        restored = (w.music_dir == original_music and w.download_dir == original_dl)
+        back = SettingsDialog(original_music, original_video,
+                              True, original_dl)
+        back.applied.connect(lambda: w._apply_settings(back))
+        back.folders_music.paths = list(original_music)
+        back.folders_video.paths = list(original_video)
+        back.chk_separate.setChecked(True)
+        back._accept()
+        restored = (w.music_dirs == original_music
+                    and w.video_dirs == original_video
+                    and w.download_dir == original_dl
+                    and w.video_separate_window)
         return (changed and restored,
                 f"appliqué={'OK' if changed else 'KO'} "
                 f"restauré={'OK' if restored else 'KO'}")
     finally:
-        for d in (tmp_lib, tmp_dl):
+        for d in (tmp_lib, tmp_vid, tmp_dl):
             shutil.rmtree(d, ignore_errors=True)
 
 
@@ -2971,14 +3161,14 @@ def _test_separate_dir(w) -> tuple[bool, str]:
     """Un fichier posé dans le dossier de téléchargement rejoint la bibliothèque."""
     import tempfile
     original_dl = w.download_dir
-    original_music = w.music_dir
+    original_music = list(w.music_dirs)
     original_tracks = list(w.tracks)
     original_index = w.index
     tmp_dl = Path(tempfile.mkdtemp(prefix="wp-collect-"))
     lib = Path(tempfile.mkdtemp(prefix="wp-dest-"))
     try:
         w.set_download_dir(tmp_dl)
-        w.music_dir = lib
+        w.music_dirs = [lib]
         # Un fichier factice dans le dossier de téléchargement.
         fake = tmp_dl / "Titre de test.mp3"
         fake.write_bytes(b"ID3\x03\x00\x00\x00\x00\x00\x00")
@@ -2993,7 +3183,7 @@ def _test_separate_dir(w) -> tuple[bool, str]:
     finally:
         # Restaure exactement l'état d'avant : sans cela la playlist
         # pointerait sur un dossier temporaire supprimé.
-        w.music_dir = original_music
+        w.music_dirs = original_music
         w.tracks = original_tracks
         w.index = original_index
         w.set_download_dir(original_dl)
@@ -3033,7 +3223,7 @@ def _test_playlist_load() -> tuple[bool, str]:
         (lib / "y.mp3").write_bytes(b"ID3\x03\x00")
         store = PlaylistStore(tmp)
         store.save("Deux", ["x.mp3", "y.mp3"])
-        resolved = resolve_playlist(store.load("Deux"), lib)
+        resolved = resolve_playlist(store.load("Deux"), [lib])
         return (len(resolved) == 2 and resolved[0].name == "x.mp3",
                 f"{len(resolved)} chemins résolus")
     finally:
@@ -3076,7 +3266,7 @@ def _test_playlist_missing() -> tuple[bool, str]:
         (lib / "present.mp3").write_bytes(b"ID3\x03\x00")
         store = PlaylistStore(tmp)
         store.save("L", ["absent.mp3", "present.mp3"])
-        resolved = resolve_playlist(store.load("L"), lib)
+        resolved = resolve_playlist(store.load("L"), [lib])
         return (len(resolved) == 1 and resolved[0].name == "present.mp3",
                 f"{len(resolved)}/2 fichier(s) trouvé(s), l'absent est ignoré")
     finally:
@@ -3088,7 +3278,9 @@ def _test_playlist_play(w) -> tuple[bool, str]:
     import tempfile
     tmp = Path(tempfile.mkdtemp(prefix="wp-pl-"))
     try:
-        names = [p.name for p in w.tracks[:3]]
+        # On ne prend que des audio : la playlist résout dans music_dirs.
+        names = [p.name for p in w.tracks
+                 if p.suffix.lower() in AUDIO_EXTS][:3]
         w.playlists.base = tmp
         w.playlists.save("Test", names)
         w.load_playlist("Test")
@@ -3105,7 +3297,8 @@ def _test_playlist_next(w) -> tuple[bool, str]:
     import tempfile
     tmp = Path(tempfile.mkdtemp(prefix="wp-pl-"))
     try:
-        names = [p.name for p in w.tracks[:2]]
+        names = [p.name for p in w.tracks
+                 if p.suffix.lower() in AUDIO_EXTS][:2]
         w.playlists.base = tmp
         w.playlists.save("Court", names)
         w.load_playlist("Court")
@@ -3206,6 +3399,8 @@ def _test_video_window(w) -> tuple[bool, str]:
         proc.waitForFinished(60_000)
         if not out.exists():
             return (False, "génération du mp4 de test impossible")
+        # Le test force le mode fenêtre pour vérifier le chemin d'ouverture.
+        w.set_video_separate_window(True)
         w.open_video(out)
         opened = w.video_win is not None and w.video_win.isVisible()
         w.close_video()
@@ -3252,14 +3447,31 @@ def _test_video_dir_creation(w) -> tuple[bool, str]:
     parent = Path(tempfile.mkdtemp(prefix="wp-vdir-"))
     target = parent / "sous" / "dossier"      # volontairement inexistant
     try:
-        w.set_video_dir(target)
+        w.set_video_dirs([target])
         created = target.is_dir()
         wd = w.vdlg.proc.workingDirectory()
         ok = created and wd == str(target)
         return (ok, f"créé={created} dossier de travail={wd}")
     finally:
-        w.set_video_dir(w.settings.value("video_dir", VIDEO_DIR_DEFAULT))
+        w.set_video_dirs(w.settings.value("video_dirs",
+                                          json.dumps([str(VIDEO_DIR_DEFAULT)]))
+                        and [Path(d) for d in json.loads(w.settings.value("video_dirs"))]
+                        or [VIDEO_DIR_DEFAULT])
         shutil.rmtree(parent, ignore_errors=True)
+
+
+def _test_video_separate_window(w) -> tuple[bool, str]:
+    """La fenêtre vidéo peut être coupée : la lecture reste mais pas d'image."""
+    original = w.video_separate_window
+    try:
+        w.set_video_separate_window(False)
+        disabled = not w.video_separate_window
+        w.set_video_separate_window(True)
+        enabled = w.video_separate_window
+        return (disabled and enabled,
+                f"désactivé={disabled} réactivé={enabled}")
+    finally:
+        w.set_video_separate_window(original)
 
 
 def _test_version_compare() -> tuple[bool, str]:
@@ -3440,9 +3652,9 @@ def _test_video_codec(w) -> tuple[bool, str]:
     if not url:
         return (False, "aucune URL de test fournie")
     tmp = Path(tempfile.mkdtemp(prefix="wp-codec-"))
-    original = w.video_dir
+    original = list(w.video_dirs)
     try:
-        w.set_video_dir(tmp)
+        w.set_video_dirs([tmp])
         dlg = w.vdlg
         dlg.input.setPlainText(url)
         dlg.quality.setCurrentIndex(4)          # 360p : le plus rapide
@@ -3461,7 +3673,7 @@ def _test_video_codec(w) -> tuple[bool, str]:
         return (ok, f"codec vidéo = {codec} "
                     f"({'décodable' if ok else 'NON décodable par Qt'})")
     finally:
-        w.set_video_dir(original)
+        w.set_video_dirs(original)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -3476,9 +3688,9 @@ def _test_video_download(w) -> tuple[bool, str]:
     if not url:
         return (False, "aucune URL de test fournie")
     tmp = Path(tempfile.mkdtemp(prefix="wp-vdl-"))
-    original = w.video_dir
+    original = list(w.video_dirs)
     try:
-        w.set_video_dir(tmp)
+        w.set_video_dirs([tmp])
         dlg = w.vdlg
         dlg.input.setPlainText(url)
         dlg.quality.setCurrentIndex(4)          # 360p : le plus rapide
@@ -3498,7 +3710,7 @@ def _test_video_download(w) -> tuple[bool, str]:
                 f"{produced.name if produced else 'aucun fichier'} "
                 f"({size_mb:.1f} Mo, code={dlg.proc.exitCode()})")
     finally:
-        w.set_video_dir(original)
+        w.set_video_dirs(original)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -3603,9 +3815,10 @@ def _self_test(app: QApplication, w: "Player", url: str | None = None) -> int:
         ("menu tray complet", lambda: (
             len(w.tray.contextMenu().actions()) >= 8,
             f"{len(w.tray.contextMenu().actions())} entrées")),
-        ("dossier musique configurable", lambda: (
-            hasattr(w, "choose_music_dir") and hasattr(w, "change_music_dir"),
-            str(w.music_dir))),
+        ("dossiers musique configurables", lambda: (
+            hasattr(w, "choose_music_dir") and hasattr(w, "change_music_dirs")
+            and hasattr(w, "set_music_dirs"),
+            f"{len(w.music_dirs)} dossier(s) : {w.music_dirs}")),
         ("changement de dossier", lambda: _test_change_dir(w)),
         # --- playlists -------------------------------------------------------
         ("playlist : création et sauvegarde", lambda: _test_playlist_save()),
@@ -3625,6 +3838,7 @@ def _self_test(app: QApplication, w: "Player", url: str | None = None) -> int:
         ("vidéo : fenêtre de lecture", lambda: _test_video_window(w)),
         ("vidéo : plein écran accessible", lambda: _test_video_fullscreen(w)),
         ("vidéo : dossier absent créé à la volée", lambda: _test_video_dir_creation(w)),
+        ("vidéo : fenêtre séparée désactivable", lambda: _test_video_separate_window(w)),
         ("vidéo : codec décodable par Qt", lambda: _test_video_codec(w)),
         ("vidéo : téléchargement réel via le dialogue", lambda: _test_video_download(w)),
         ("yt-dlp localisé", lambda: (find_ytdlp() is not None, str(find_ytdlp()))),
@@ -3701,28 +3915,45 @@ def main() -> int:
 
     # Ordre de priorité : variable d'environnement > choix mémorisé > défaut.
     prefs = QSettings("com.m5max", "WorkPlay")
-    saved = prefs.value("music_dir")
-    music_dir = Path(
-        os.environ.get("WORKPLAY_DIR") or saved or MUSIC_DIR_DEFAULT
-    ).expanduser()
-    saved_dl = prefs.value("download_dir")
-    download_dir = Path(saved_dl).expanduser() if saved_dl else music_dir
-    saved_vid = prefs.value("video_dir")
-    video_dir = Path(saved_vid).expanduser() if saved_vid else VIDEO_DIR_DEFAULT
 
-    # Au premier lancement on crée le dossier au lieu d'échouer : l'utilisateur
-    # n'a qu'à y déposer ses fichiers, ou les télécharger depuis le tray.
-    for d in {music_dir, download_dir, video_dir}:
+    def _load_dirs(key: str, fallback: Path) -> list[Path]:
+        """Lit une liste JSON ; si vide ou invalide, retombe sur le défaut."""
+        raw = prefs.value(key)
+        if raw:
+            try:
+                dirs = json.loads(raw)
+                if isinstance(dirs, list):
+                    return [Path(d).expanduser() for d in dirs]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # Compatibilité : l'ancienne clé unique est convertie en liste.
+        old = prefs.value(key.replace("_dirs", "_dir"))
+        if old:
+            return [Path(old).expanduser()]
+        return [fallback]
+
+    music_dirs = _load_dirs("music_dirs", MUSIC_DIR_DEFAULT)
+    video_dirs = _load_dirs("video_dirs", VIDEO_DIR_DEFAULT)
+
+    # Le dossier de téléchargement reste unique : c'est le point d'atterrissage.
+    saved_dl = prefs.value("download_dir")
+    download_dir = Path(saved_dl).expanduser() if saved_dl else (
+        music_dirs[0] if music_dirs else Path.home()
+    )
+
+    # Au premier lancement on crée les dossiers au lieu d'échouer.
+    for d in set(music_dirs + [download_dir] + video_dirs):
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             print(f"Impossible de créer {d} : {exc}", file=sys.stderr)
             return 1
 
-    w = Player(music_dir, download_dir)
-    w.video_dir = video_dir
-    w.vdlg.video_dir = video_dir
-    w.vdlg.proc.setWorkingDirectory(str(video_dir))
+    w = Player(music_dirs, download_dir)
+    w.set_video_dirs(video_dirs)
+    w.set_video_separate_window(
+        prefs.value("video_separate_window", "1") == "1"
+    )
     w.show()
     w.raise_()
     # Volontairement pas d'activateWindow() : WorkPlay ne doit jamais
