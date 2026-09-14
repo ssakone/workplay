@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (
 # Version de l'application. C'est la SEULE source de vérité côté code : le
 # bundle .app la reprend depuis workplay.spec, et tools/build.sh vérifie que
 # les deux concordent pour éviter qu'une release annonce un mauvais numéro.
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.5.0"
 
 # Mises à jour : dépôt public, releases GitHub.
 UPDATE_REPO = "ssakone/workplay"
