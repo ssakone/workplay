@@ -99,6 +99,24 @@ REPEAT_LABEL = {
 # l'application est générique.
 PREFERRED_ORDER: list[str] = []
 
+# Filtres de la bibliothèque : ce que l'utilisateur choisit de voir dans la liste.
+FILTER_ALL, FILTER_AUDIO, FILTER_VIDEO = "all", "audio", "video"
+FILTER_LABEL = {
+    FILTER_ALL: "Tout (audio + vidéo)",
+    FILTER_AUDIO: "Musique seulement",
+    FILTER_VIDEO: "Vidéos seulement",
+}
+
+
+def matches_filter(path: Path, mode: str) -> bool:
+    """Vrai si le fichier appartient au filtre demandé."""
+    suffix = path.suffix.lower()
+    if mode == FILTER_AUDIO:
+        return suffix in AUDIO_EXTS
+    if mode == FILTER_VIDEO:
+        return suffix in VIDEO_EXTS
+    return suffix in AUDIO_EXTS | VIDEO_EXTS
+
 # Exemple — décommente et adapte pour épingler tes morceaux en tête :
 # PREFERRED_ORDER = ["Mon morceau préféré", "Un autre titre"]
 
@@ -1641,11 +1659,60 @@ class VideoWindow(QWidget):
 
         root.addWidget(self.bar)
 
+        # --- Barre de progression + temps ----------------------------------
+        # Sans elle, une vidéo est impossible à piloter : on ne peut ni voir où
+        # on en est, ni avancer, ni revenir en arrière.
+        self.seek_row = QWidget()
+        self.seek_row.setStyleSheet("background-color: rgba(16,16,20,235);")
+        seek = QHBoxLayout(self.seek_row)
+        seek.setContentsMargins(10, 0, 10, 7)
+        seek.setSpacing(8)
+
+        self.lbl_pos = QLabel("0:00")
+        self.lbl_pos.setStyleSheet(
+            "color:rgba(235,235,245,180);font-size:11px;"
+        )
+        self.lbl_pos.setFixedWidth(46)
+        seek.addWidget(self.lbl_pos)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 0)
+        self.slider.setStyleSheet(
+            "QSlider::groove:horizontal{height:4px;"
+            "background:rgba(255,255,255,40);border-radius:2px;}"
+            "QSlider::sub-page:horizontal{background:#7c5cff;border-radius:2px;}"
+            "QSlider::handle:horizontal{width:12px;height:12px;margin:-4px 0;"
+            "border-radius:6px;background:#f2f2f7;}"
+        )
+        self.slider.sliderPressed.connect(self._seek_start)
+        self.slider.sliderReleased.connect(self._seek_end)
+        self.slider.sliderMoved.connect(self._seek_move)
+        seek.addWidget(self.slider, 1)
+
+        self.lbl_dur = QLabel("0:00")
+        self.lbl_dur.setStyleSheet(
+            "color:rgba(235,235,245,180);font-size:11px;"
+        )
+        self.lbl_dur.setFixedWidth(46)
+        self.lbl_dur.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        seek.addWidget(self.lbl_dur)
+
+        root.addWidget(self.seek_row)
+
+        # La fenêtre partage le lecteur du widget : on écoute les mêmes signaux
+        # pour rester synchronisée, quel que soit l'endroit d'où on pilote.
+        self._seeking = False
+        player.positionChanged.connect(self._on_position)
+        player.durationChanged.connect(self._on_duration)
+        player.playbackStateChanged.connect(lambda _s: self._sync_button())
+
         # Raccourcis : la fenêtre a le focus, ils sont donc fiables.
         QShortcut(QKeySequence(Qt.Key_Space), self, self.toggle_play)
         QShortcut(QKeySequence(Qt.Key_F), self, self.toggle_fullscreen)
         QShortcut(QKeySequence(Qt.Key_A), self, self.fit_video)
         QShortcut(QKeySequence(Qt.Key_Escape), self, self._escape)
+        QShortcut(QKeySequence(Qt.Key_Left), self, lambda: self.skip(-10_000))
+        QShortcut(QKeySequence(Qt.Key_Right), self, lambda: self.skip(10_000))
 
         self.zoom = 1.0
         # Base de référence du zoom quand Qt ne connaît pas la taille vidéo.
@@ -1666,6 +1733,34 @@ class VideoWindow(QWidget):
         """Affiche un avertissement lisible au-dessus de l'image."""
         self.warning.setText(message)
         self.warning.show()
+
+    # --------------------------------------------------------- progression --
+    def _on_position(self, ms: int) -> None:
+        if not self._seeking:
+            self.slider.setValue(ms)
+        self.lbl_pos.setText(format_time(ms))
+
+    def _on_duration(self, ms: int) -> None:
+        self.slider.setRange(0, ms)
+        self.lbl_dur.setText(format_time(ms))
+
+    def _seek_start(self) -> None:
+        self._seeking = True
+
+    def _seek_move(self, v: int) -> None:
+        self.lbl_pos.setText(format_time(v))
+
+    def _seek_end(self) -> None:
+        self.player.setPosition(self.slider.value())
+        self._seeking = False
+
+    def skip(self, delta_ms: int) -> None:
+        """Avance ou recule de quelques secondes (flèches ← →)."""
+        pos = max(0, self.player.position() + delta_ms)
+        dur = self.player.duration()
+        if dur and pos > dur:
+            pos = dur
+        self.player.setPosition(pos)
 
     # ------------------------------------------------------------ contrôle --
     def showEvent(self, e) -> None:
@@ -1745,6 +1840,7 @@ class VideoWindow(QWidget):
             return
 
         bar_h = self.bar.height() if self.bar.isVisible() else 0
+        bar_h += self.seek_row.height() if self.seek_row.isVisible() else 0
         vw, vh = self._source_size()
         if vw:
             base_w, base_h = vw, vh
@@ -1786,11 +1882,13 @@ class VideoWindow(QWidget):
         if self.isFullScreen():
             self.showNormal()
             self.bar.show()
+            self.seek_row.show()
             self.btn_full.setText("⛶")
             self._apply_zoom()
         else:
             self.showFullScreen()
             self.bar.hide()
+            self.seek_row.hide()
             self.btn_full.setText("⤡")
             self.lbl_zoom.setText("plein écran")
 
@@ -2092,6 +2190,9 @@ class Player(QWidget):
         self.download_dir = download_dir or (
             self.music_dirs[0] if self.music_dirs else Path.home()
         )
+        # Filtre de la liste : « musique seulement » permet de revenir à un
+        # lecteur purement audio, sans les vidéos dans la liste.
+        self.library_filter: str = FILTER_ALL
         self.tracks: list[Path] = scan_media(self.music_dirs + self.video_dirs)
         self.index = -1
         self._drag_offset: QPoint | None = None
@@ -2383,6 +2484,16 @@ class Player(QWidget):
 
         self.menu_playlists = menu.addMenu("Jouer une playlist")
         self.refresh_playlist_menu()
+
+        # --- Filtre de la liste ----------------------------------------------
+        self.menu_filter = menu.addMenu("Afficher dans la liste")
+        self.filter_actions = {}
+        for mode in (FILTER_ALL, FILTER_AUDIO, FILTER_VIDEO):
+            act = self.menu_filter.addAction(FILTER_LABEL[mode])
+            act.setCheckable(True)
+            act.setChecked(self.library_filter == mode)
+            act.triggered.connect(lambda _=False, m=mode: self.set_filter(m))
+            self.filter_actions[mode] = act
 
         # --- Répétition ------------------------------------------------------
         menu.addSeparator()
@@ -2679,16 +2790,48 @@ class Player(QWidget):
         )
 
     def load_library(self) -> None:
-        """Revient à la bibliothèque complète (audio + vidéo, tous dossiers)."""
+        """Revient à la bibliothèque complète, filtrée selon le choix affiché."""
         self.current_playlist = None
-        self.tracks = scan_media(self.music_dirs + self.video_dirs)
+        self.tracks = self._scan_filtered()
         self._fill_list()
         self.lbl_artist.setText(self._count_label())
         if self.tracks:
             self.play_index(0)
         else:
             self.player.stop()
-            self.lbl_title.setText("Aucun fichier audio")
+            self.lbl_title.setText("Aucun fichier")
+
+    def _scan_filtered(self) -> list[Path]:
+        """Tous les fichiers déclarés, restreints au filtre courant."""
+        return [p for p in scan_media(self.music_dirs + self.video_dirs)
+                if matches_filter(p, self.library_filter)]
+
+    def set_filter(self, mode: str) -> None:
+        """Bascule la liste sur un filtre : tout, musique seule, vidéos seules.
+
+        En quittant le mode vidéo on ferme la fenêtre d'image : l'utilisateur
+        revient à un lecteur audio, il ne doit pas rester une vidéo ouverte.
+        """
+        if mode not in FILTER_LABEL or mode == self.library_filter:
+            return
+        self.library_filter = mode
+        self.settings.setValue("library_filter", mode)
+        self._persist()
+        for m, act in self.filter_actions.items():
+            act.setChecked(m == mode)
+        if mode != FILTER_VIDEO:
+            self.close_video()
+        # Une playlist explicite n'est pas concernée : c'est un choix de
+        # l'utilisateur sur un contenu déjà fixé.
+        if self.current_playlist:
+            return
+        self.index = -1
+        self.refresh_tracks(force=True)
+        if self.tracks and self.player.playbackState() != QMediaPlayer.PlayingState:
+            self.play_index(0)
+        elif not self.tracks:
+            self.player.stop()
+            self.lbl_title.setText("Aucun fichier")
 
     def load_playlist(self, name: str) -> None:
         """Charge une playlist nommée et démarre sa lecture."""
@@ -2789,7 +2932,6 @@ class Player(QWidget):
         joue dans le widget (son seul, pas d'image).
         """
         self.lbl_title.setText(path.stem)
-        self.lbl_artist.setText(f"vidéo · {path.name}")
         if self.video_separate_window:
             self.open_video(path)
         self.player.setSource(QUrl.fromLocalFile(str(path)))
@@ -2815,7 +2957,7 @@ class Player(QWidget):
     def refresh_tracks(self, force: bool = False) -> None:
         """Relit tous les dossiers et met la liste à jour sans couper la lecture."""
         playing = self.tracks[self.index].stem if 0 <= self.index < len(self.tracks) else None
-        new = scan_media(self.music_dirs + self.video_dirs)
+        new = self._scan_filtered()
         if new == self.tracks and not force:
             return
 
@@ -2855,15 +2997,26 @@ class Player(QWidget):
     # ------------------------------------------------------------ lecture --
     def play_index(self, i: int) -> None:
         if not self.tracks:
-            self.lbl_title.setText("Aucun fichier audio")
+            self.lbl_title.setText("Aucun fichier")
             return
         self.index = i % len(self.tracks)
         track = self.tracks[self.index]
+        self.list.setCurrentRow(self.index)
+        # Les vidéos partent sur leur propre chemin : elles ont besoin d'une
+        # surface de rendu, que le widget compact ne fournit pas.
+        if track.suffix.lower() in VIDEO_EXTS:
+            self.play_video(track)
+            self.lbl_artist.setText(
+                f"{self.index + 1}/{len(self.tracks)} · vidéo"
+            )
+            return
+        # Passage d'une vidéo à de la musique : on referme l'image, sinon la
+        # fenêtre resterait ouverte sur un écran noir.
+        self.close_video()
         self.player.setSource(QUrl.fromLocalFile(str(track)))
         self.player.play()
         self.lbl_title.setText(track.stem)
         self.lbl_artist.setText(f"{self.index + 1}/{len(self.tracks)}")
-        self.list.setCurrentRow(self.index)
 
     def toggle_play(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -3460,6 +3613,249 @@ def _test_video_dir_creation(w) -> tuple[bool, str]:
         shutil.rmtree(parent, ignore_errors=True)
 
 
+def _make_test_clip() -> tuple[Path | None, str]:
+    """Génère un court mp4 H.264 jouable par Qt. Retourne (chemin, erreur)."""
+    ff = find_ffmpeg()
+    if ff is None:
+        return None, "ffmpeg absent"
+    tmp = Path(tempfile.mkdtemp(prefix="wp-clip-"))
+    out = tmp / "clip.mp4"
+    proc = QProcess()
+    proc.start(ff, ["-y", "-v", "error", "-f", "lavfi",
+                    "-i", "testsrc=size=320x240:rate=15",
+                    "-t", "2", "-pix_fmt", "yuv420p", str(out)])
+    proc.waitForFinished(60_000)
+    if not out.is_file():
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, "génération du mp4 impossible"
+    return out, ""
+
+
+def _test_library_filter(w) -> tuple[bool, str]:
+    """Le filtre « musique seulement » retire les vidéos de la liste."""
+    import tempfile
+    original_filter = w.library_filter
+    original_dirs = list(w.video_dirs)
+    clip = None
+    tmp = Path(tempfile.mkdtemp(prefix="wp-filter-"))
+    try:
+        made, err = _make_test_clip()
+        if made is None:
+            return (False, err)
+        clip = made.parent
+        shutil.move(str(made), str(tmp / "film.mp4"))
+        # La vidéo n'apparaît dans la liste que si son dossier est déclaré.
+        w.video_dirs = [tmp]
+        # set_filter() est un no-op si le mode ne change pas : on force le
+        # rescan pour que la mesure porte bien sur les nouveaux dossiers.
+        w.refresh_tracks(force=True)
+
+        w.set_filter(FILTER_ALL)
+        w.refresh_tracks(force=True)
+        n_all = len(w.tracks)
+        has_video = any(p.suffix.lower() in VIDEO_EXTS for p in w.tracks)
+
+        w.set_filter(FILTER_AUDIO)
+        only_audio = all(p.suffix.lower() in AUDIO_EXTS for p in w.tracks)
+        n_audio = len(w.tracks)
+
+        w.set_filter(FILTER_VIDEO)
+        only_video = all(p.suffix.lower() in VIDEO_EXTS for p in w.tracks)
+        n_video = len(w.tracks)
+
+        ok = (has_video and only_audio and only_video
+              and n_all == n_audio + n_video and n_video >= 1)
+        return (ok, f"tout={n_all} audio={n_audio} vidéo={n_video}")
+    finally:
+        w.video_dirs = original_dirs
+        w.set_filter(original_filter)
+        w.refresh_tracks(force=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+        if clip is not None:
+            shutil.rmtree(clip, ignore_errors=True)
+
+
+def _test_play_index_routes_video(w) -> tuple[bool, str]:
+    """Jouer une piste vidéo passe par play_video, pas par le lecteur brut.
+
+    C'est le bug qui rendait le lecteur vidéo « nul » : le double-clic sur une
+    vidéo dans la liste chargeait le fichier sans jamais ouvrir l'image.
+    """
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="wp-route-"))
+    original_dirs = list(w.video_dirs)
+    original_filter = w.library_filter
+    original_separate = w.video_separate_window
+    try:
+        made, err = _make_test_clip()
+        if made is None:
+            return (False, err)
+        clip = tmp / "film.mp4"
+        shutil.move(str(made), str(clip))
+        shutil.rmtree(made.parent, ignore_errors=True)
+
+        w.video_dirs = [tmp]
+        w.set_filter(FILTER_ALL)
+        w.refresh_tracks(force=True)
+        if clip not in w.tracks:
+            return (False, "la vidéo n'est pas dans la liste")
+
+        # On intercepte play_video : c'est lui qui doit ouvrir l'image.
+        calls: list[Path] = []
+        original_play_video = w.play_video
+        w.play_video = lambda p: calls.append(p)  # type: ignore[assignment]
+        try:
+            w.play_index(w.tracks.index(clip))
+        finally:
+            w.play_video = original_play_video  # type: ignore[assignment]
+
+        # Et le lecteur ne doit PAS être chargé directement avec la vidéo.
+        src = w.player.source().toLocalFile()
+        routed = calls == [clip]
+        not_raw = src == "" or not src.endswith(".mp4")
+        ok = routed and not_raw
+        return (ok, f"routé={routed} source_brute='{src}'")
+    finally:
+        w.player.stop()
+        w.player.setSource(QUrl())
+        w.video_dirs = original_dirs
+        w.set_filter(original_filter)
+        w.set_video_separate_window(original_separate)
+        w.refresh_tracks(force=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_audio_after_video(w) -> tuple[bool, str]:
+    """Revenir à la musique ferme la fenêtre vidéo : pas d'écran noir laissé."""
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="wp-back-"))
+    original_dirs = list(w.video_dirs)
+    original_filter = w.library_filter
+    original_separate = w.video_separate_window
+    try:
+        made, err = _make_test_clip()
+        if made is None:
+            return (False, err)
+        clip = tmp / "film.mp4"
+        shutil.move(str(made), str(clip))
+        shutil.rmtree(made.parent, ignore_errors=True)
+
+        w.video_dirs = [tmp]
+        w.set_video_separate_window(True)
+        w.set_filter(FILTER_ALL)
+        w.refresh_tracks(force=True)
+
+        w.play_video(clip)
+        opened = w.video_win is not None and w.video_win.isVisible()
+
+        # Repasser sur un morceau doit refermer l'image.
+        audio = next((p for p in w.tracks
+                      if p.suffix.lower() in AUDIO_EXTS), None)
+        if audio is None:
+            return (False, "aucun morceau audio en bibliothèque")
+        w.play_index(w.tracks.index(audio))
+        closed = not (w.video_win is not None and w.video_win.isVisible())
+        on_audio = w.player.source().toLocalFile() == str(audio)
+
+        ok = opened and closed and on_audio
+        return (ok, f"ouverte={opened} refermée={closed} "
+                    f"audio={'OK' if on_audio else 'KO'}")
+    finally:
+        w.close_video()
+        w.player.stop()
+        w.video_dirs = original_dirs
+        w.set_filter(original_filter)
+        w.set_video_separate_window(original_separate)
+        w.refresh_tracks(force=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_video_window_seek(w) -> tuple[bool, str]:
+    """La fenêtre vidéo pilote la lecture : barre, temps, saut, raccourcis.
+
+    On vérifie le câblage plutôt que le chargement média réel : ce dernier est
+    asynchrone et dépend de l'état du lecteur, donc non déterministe dans une
+    suite de tests. Ici chaque signal est injecté directement, ce qui prouve
+    que l'interface réagit comme l'utilisateur l'attend.
+    """
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="wp-seek-"))
+    try:
+        ff = find_ffmpeg()
+        if ff is None:
+            return (False, "ffmpeg absent")
+        out = tmp / "clip.mp4"
+        proc = QProcess()
+        proc.start(ff, ["-y", "-v", "error", "-f", "lavfi",
+                        "-i", "testsrc=size=320x240:rate=15",
+                        "-t", "2", "-pix_fmt", "yuv420p", str(out)])
+        proc.waitForFinished(60_000)
+        if not out.is_file():
+            return (False, "génération du mp4 impossible")
+
+        w.set_video_separate_window(True)
+        w.play_video(out)
+        win = w.video_win
+        if win is None or not hasattr(win, "slider"):
+            w.close_video()
+            return (False, "fenêtre ou barre absente")
+
+        # La durée annoncée pilote la plage du curseur et le label de droite.
+        win._on_duration(125_000)
+        dur_ok = (win.slider.maximum() == 125_000
+                  and win.lbl_dur.text() == "2:05")
+
+        # La position courante suit dans le curseur et le label de gauche.
+        win._on_position(60_000)
+        pos_ok = (win.slider.value() == 60_000
+                  and win.lbl_pos.text() == "1:00")
+
+        # Pendant un glisser, le curseur ne doit pas être écrasé par le lecteur.
+        win._seek_start()
+        win._on_position(10_000)
+        drag_ok = (win._seeking and win.slider.value() == 60_000
+                   and win.lbl_pos.text() == "0:10")
+        win._seek_end()
+        released_ok = not win._seeking
+
+        # skip() doit calculer une nouvelle position bornée, sans déborder.
+        seen: list[int] = []
+        player = win.player
+        original_set = player.setPosition
+        original_pos = player.position
+        original_dur = player.duration
+        try:
+            player.position = lambda: 5_000            # type: ignore
+            player.duration = lambda: 125_000          # type: ignore
+            player.setPosition = lambda ms: seen.append(ms)  # type: ignore
+            win.skip(3_000)
+            win.skip(-10_000)      # ne doit jamais passer sous zéro
+            player.position = lambda: 124_000          # type: ignore
+            win.skip(10_000)
+        finally:
+            player.setPosition = original_set          # type: ignore
+            player.position = original_pos             # type: ignore
+            player.duration = original_dur             # type: ignore
+        # Attendu : 8000, 0 (borné), 125000 (borné à la durée).
+        skip_ok = seen == [8_000, 0, 125_000]
+
+        # Les flèches doivent être branchées sur la fenêtre.
+        shortcuts = {str(sc.key().toString())
+                     for sc in win.findChildren(QShortcut)}
+        keys_ok = "Left" in shortcuts and "Right" in shortcuts
+
+        w.close_video()
+        checks = {"durée": dur_ok, "position": pos_ok, "glisser": drag_ok,
+                  "relâcher": released_ok, "skip": skip_ok,
+                  "flèches": keys_ok}
+        ok = all(checks.values())
+        details = " ".join(f"{k}={'OK' if v else 'KO'}"
+                           for k, v in checks.items())
+        return (ok, f"{details} positions={seen}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _test_video_separate_window(w) -> tuple[bool, str]:
     """La fenêtre vidéo peut être coupée : la lecture reste mais pas d'image."""
     original = w.video_separate_window
@@ -3839,6 +4235,10 @@ def _self_test(app: QApplication, w: "Player", url: str | None = None) -> int:
         ("vidéo : plein écran accessible", lambda: _test_video_fullscreen(w)),
         ("vidéo : dossier absent créé à la volée", lambda: _test_video_dir_creation(w)),
         ("vidéo : fenêtre séparée désactivable", lambda: _test_video_separate_window(w)),
+        ("liste : filtre musique/vidéo/tout", lambda: _test_library_filter(w)),
+        ("liste : la vidéo part vers la fenêtre", lambda: _test_play_index_routes_video(w)),
+        ("retour musique ferme la fenêtre vidéo", lambda: _test_audio_after_video(w)),
+        ("vidéo : barre de progression + temps", lambda: _test_video_window_seek(w)),
         ("vidéo : codec décodable par Qt", lambda: _test_video_codec(w)),
         ("vidéo : téléchargement réel via le dialogue", lambda: _test_video_download(w)),
         ("yt-dlp localisé", lambda: (find_ytdlp() is not None, str(find_ytdlp()))),
@@ -3954,6 +4354,14 @@ def main() -> int:
     w.set_video_separate_window(
         prefs.value("video_separate_window", "1") == "1"
     )
+    # Le filtre mémorisé est restauré sans recharger : la liste est déjà
+    # construite selon lui par _scan_filtered au prochain refresh.
+    saved_filter = prefs.value("library_filter", FILTER_ALL)
+    if saved_filter in FILTER_LABEL:
+        w.library_filter = saved_filter
+        for m, act in w.filter_actions.items():
+            act.setChecked(m == saved_filter)
+        w.refresh_tracks(force=True)
     w.show()
     w.raise_()
     # Volontairement pas d'activateWindow() : WorkPlay ne doit jamais
